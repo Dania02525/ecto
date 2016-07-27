@@ -5,9 +5,9 @@ defmodule Ecto.Repo.Assoc do
 
   @doc """
   Transforms a result set based on query assocs, loading
-  the associations onto their parent model.
+  the associations onto their parent schema.
   """
-  @spec query([Ecto.Model.t], list, tuple) :: [Ecto.Model.t]
+  @spec query([Ecto.Schema.t], list, tuple) :: [Ecto.Schema.t]
   def query(rows, assocs, sources)
 
   def query([], _assocs, _sources), do: []
@@ -35,10 +35,11 @@ defmodule Ecto.Repo.Assoc do
   end
 
   defp merge([struct|sub_structs], {keys, dict, sub_dicts}, parent_key) do
-    if struct do
-      [{_, child_key}] = Ecto.Model.primary_key!(struct)
-      child_key || raise Ecto.NoPrimaryKeyValueError, struct: struct
-    end
+    child_key =
+      if struct do
+        [{_, key}] = Ecto.primary_key!(struct)
+        key || raise Ecto.NoPrimaryKeyValueError, struct: struct
+      end
 
     # Traverse sub_structs adding one by one to the tree.
     # Note we need to traverse even if we don't have a child_key
@@ -50,8 +51,8 @@ defmodule Ecto.Repo.Assoc do
     # data unless we have already processed it.
     cache = {parent_key, child_key}
 
-    if struct && parent_key && not HashSet.member?(keys, cache) do
-      keys = HashSet.put(keys, cache)
+    if struct && parent_key && not Map.get(keys, cache, false) do
+      keys = Map.put(keys, cache, true)
       item = {child_key, struct}
 
       # If we have a list, we are at the root,
@@ -60,34 +61,36 @@ defmodule Ecto.Repo.Assoc do
         if is_list(dict) do
           [{item, sub_structs}|dict]
         else
-          HashDict.update(dict, parent_key, [item], &[item|&1])
+          Map.update(dict, parent_key, [item], &[item|&1])
         end
-    end
 
-    {{keys, dict, sub_dicts}, sub_structs}
+      {{keys, dict, sub_dicts}, sub_structs}
+    else
+      {{keys, dict, sub_dicts}, sub_structs}
+    end
   end
 
   defp load_assocs({child_key, struct}, sub_dicts, refls) do
     Enum.reduce :lists.zip(sub_dicts, refls), struct, fn
       {{_keys, dict, sub_dicts}, {refl, refls}}, acc ->
+        %{field: field, cardinality: cardinality} = refl
         loaded =
           dict
-          |> HashDict.get(child_key, [])
+          |> Map.get(child_key, [])
           |> Enum.reverse()
           |> Enum.map(&load_assocs(&1, sub_dicts, refls))
-
-        if refl.cardinality == :one do
-          loaded = List.first(loaded)
-        end
-
-        Map.put(acc, refl.field, loaded)
+          |> maybe_first(cardinality)
+        Map.put(acc, field, loaded)
     end
   end
 
+  defp maybe_first(list, :one), do: List.first(list)
+  defp maybe_first(list, _), do: list
+
   defp create_refls(idx, fields, sources) do
     Enum.map(fields, fn {field, {child_idx, child_fields}} ->
-      {_source, model} = elem(sources, idx)
-      {model.__schema__(:association, field),
+      {_source, schema} = elem(sources, idx)
+      {schema.__schema__(:association, field),
        create_refls(child_idx, child_fields, sources)}
     end)
   end
@@ -97,6 +100,6 @@ defmodule Ecto.Repo.Assoc do
       create_accs(child_fields)
     end)
 
-    {HashSet.new, HashDict.new, acc}
+    {%{}, %{}, acc}
   end
 end

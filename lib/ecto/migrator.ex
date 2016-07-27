@@ -30,9 +30,16 @@ defmodule Ecto.Migrator do
 
   This function ensures the migration table exists
   if no table has been defined yet.
+
+  ## Options
+
+    * `:log` - the level to use for logging. Defaults to `:info`.
+      Can be any of `Logger.level/0` values or `false`.
+    * `:prefix` - the prefix to run the migrations on
+
   """
   @spec migrated_versions(Ecto.Repo.t, Keyword.t) :: [integer]
-  def migrated_versions(repo, opts) do
+  def migrated_versions(repo, opts \\ []) do
     SchemaMigration.ensure_schema_migrations_table!(repo, opts[:prefix])
     SchemaMigration.migrated_versions(repo, opts[:prefix])
   end
@@ -44,8 +51,9 @@ defmodule Ecto.Migrator do
 
     * `:log` - the level to use for logging. Defaults to `:info`.
       Can be any of `Logger.level/0` values or `false`.
+    * `:prefix` - the prefix to run the migrations on
   """
-  @spec up(Ecto.Repo.t, integer, Module.t, Keyword.t) :: :ok | :already_up | no_return
+  @spec up(Ecto.Repo.t, integer, module, Keyword.t) :: :ok | :already_up | no_return
   def up(repo, version, module, opts \\ []) do
     versions = migrated_versions(repo, opts)
 
@@ -75,7 +83,7 @@ defmodule Ecto.Migrator do
       Can be any of `Logger.level/0` values or `false`.
 
   """
-  @spec down(Ecto.Repo.t, integer, Module.t) :: :ok | :already_down | no_return
+  @spec down(Ecto.Repo.t, integer, module) :: :ok | :already_down | no_return
   def down(repo, version, module, opts \\ []) do
     versions = migrated_versions(repo, opts)
 
@@ -101,7 +109,7 @@ defmodule Ecto.Migrator do
       module.__migration__[:disable_ddl_transaction] ->
         fun.()
       repo.__adapter__.supports_ddl_transaction? ->
-        repo.transaction [log: false, timeout: :infinity], fun
+        repo.transaction(fun, [log: false, timeout: :infinity])
       true ->
         fun.()
     end
@@ -143,6 +151,23 @@ defmodule Ecto.Migrator do
       true ->
         raise ArgumentError, message: "expected one of :all, :to, or :step strategies"
     end
+  end
+
+  @doc """
+  Returns an array of tuples as the migration status of the given repo,
+  without actually running any migrations.
+
+  """
+  def migrations(repo, directory) do
+    versions = migrated_versions(repo)
+
+    Enum.map(pending_in_direction(versions, directory, :down) |> Enum.reverse, fn {a, b, _}
+     -> {:up, a, b}
+    end)
+    ++
+    Enum.map(pending_in_direction(versions, directory, :up), fn {a, b, _} ->
+      {:down, a, b}
+    end)
   end
 
   defp run_to(repo, versions, directory, direction, target, opts) do
@@ -200,12 +225,13 @@ defmodule Ecto.Migrator do
     end
   end
 
-  defp migrate(migrations, direction, repo, opts) do
-    if Enum.empty? migrations do
-      level = Keyword.get(opts, :log, :info)
-      log(level, "Already #{direction}")
-    end
+  defp migrate([], direction, _repo, opts) do
+    level = Keyword.get(opts, :log, :info)
+    log(level, "Already #{direction}")
+    []
+  end
 
+  defp migrate(migrations, direction, repo, opts) do
     ensure_no_duplication(migrations)
 
     Enum.map migrations, fn {version, _name, file} ->

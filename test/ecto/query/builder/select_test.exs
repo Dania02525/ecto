@@ -6,26 +6,36 @@ defmodule Ecto.Query.Builder.SelectTest do
   doctest Ecto.Query.Builder.Select
 
   test "escape" do
-    assert {Macro.escape(quote do &0 end), %{}} ==
+    assert {Macro.escape(quote do &0 end), {%{}, %{}}} ==
            escape(quote do x end, [x: 0], __ENV__)
 
-    assert {Macro.escape(quote do &0.y end), %{}} ==
+    assert {Macro.escape(quote do &0.y end), {%{}, %{}}} ==
            escape(quote do x.y end, [x: 0], __ENV__)
 
-    assert {{:{}, [], [:{}, [], [0, 1, 2]]}, %{}} ==
+    assert {Macro.escape(quote do &0 end), {%{}, %{0 => {:any, [:foo, :bar, baz: :bat]}}}} ==
+           escape(quote do [:foo, :bar, baz: :bat] end, [x: 0], __ENV__)
+
+    assert {Macro.escape(quote do &0 end), {%{}, %{0 => {:struct, [:foo, :bar, baz: :bat]}}}} ==
+           escape(quote do struct(x, [:foo, :bar, baz: :bat]) end, [x: 0], __ENV__)
+
+    assert {Macro.escape(quote do &0 end), {%{}, %{0 => {:map, [:foo, :bar, baz: :bat]}}}} ==
+           escape(quote do map(x, [:foo, :bar, baz: :bat]) end, [x: 0], __ENV__)
+
+    assert {{:{}, [], [:{}, [], [0, 1, 2]]}, {%{}, %{}}} ==
            escape(quote do {0, 1, 2} end, [], __ENV__)
 
-    assert {{:{}, [], [:%{}, [], [a: {:{}, [], [:&, [], [0]]}]]}, %{}} ==
+    assert {{:{}, [], [:%{}, [], [a: {:{}, [], [:&, [], [0]]}]]}, {%{}, %{}}} ==
            escape(quote do %{a: a} end, [a: 0], __ENV__)
 
-    assert {[Macro.escape(quote do &0.y end), Macro.escape(quote do &0.z end)], %{}} ==
+    assert {{:{}, [], [:%{}, [], [{{:{}, [], [:&, [], [0]]}, {:{}, [], [:&, [], [1]]}}]]}, {%{}, %{}}} ==
+           escape(quote do %{a => b} end, [a: 0, b: 1], __ENV__)
+
+    assert {[Macro.escape(quote do &0.y end), Macro.escape(quote do &0.z end)], {%{}, %{}}} ==
            escape(quote do [x.y, x.z] end, [x: 0], __ENV__)
 
-    assert {{:{}, [], [:^, [], [0]]}, %{0 => {{:+, _, [{:x, _, _}, {:y, _, _}]}, :any}}} =
-            escape(quote do ^(x + y) end, [], __ENV__)
-
-    assert {{:{}, [], [:^, [], [0]]}, %{0 => {quote do x.y end, :any}}} ==
-            escape(quote do ^x.y end, [], __ENV__)
+    assert {[{:{}, [], [{:{}, [], [:., [], [{:{}, [], [:&, [], [0]]}, :y]]}, [], []]},
+             {:{}, [], [:^, [], [0]]}], {%{0 => {1, :any}}, %{}}} ==
+            escape(quote do [x.y, ^1] end, [x: 0], __ENV__)
   end
 
   test "only one select is allowed" do
@@ -33,5 +43,12 @@ defmodule Ecto.Query.Builder.SelectTest do
     assert_raise Ecto.Query.CompileError, message, fn ->
       %Ecto.Query{} |> select([], 1) |> select([], 2)
     end
+  end
+
+  test "select interpolation" do
+    fields = [:foo, :bar, :baz]
+    assert select("q", ^fields).select.take == %{0 => {:any, fields}}
+    assert select("q", [q], map(q, ^fields)).select.take == %{0 => {:map, fields}}
+    assert select("q", [q], struct(q, ^fields)).select.take == %{0 => {:struct, fields}}
   end
 end

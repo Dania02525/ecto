@@ -1,7 +1,7 @@
 Code.require_file "../support/types.exs", __DIR__
 
 defmodule Ecto.Integration.RepoTest do
-  use Ecto.Integration.Case
+  use Ecto.Integration.Case, async: Application.get_env(:ecto, :async_integration_tests, true)
 
   alias Ecto.Integration.TestRepo
   import Ecto.Query
@@ -13,6 +13,8 @@ defmodule Ecto.Integration.RepoTest do
   alias Ecto.Integration.Permalink
   alias Ecto.Integration.Custom
   alias Ecto.Integration.Barebone
+  alias Ecto.Integration.CompositePk
+  alias Ecto.Integration.PostUserCompositePk
 
   test "returns already started for started repos" do
     assert {:error, {:already_started, _}} = TestRepo.start_link
@@ -36,7 +38,7 @@ defmodule Ecto.Integration.RepoTest do
     assert [_] = TestRepo.all from p in Post, where: p.title in ^["1", "hello", "3"]
   end
 
-  test "fetch without model" do
+  test "fetch without schema" do
     %Post{} = TestRepo.insert!(%Post{title: "title1"})
     %Post{} = TestRepo.insert!(%Post{title: "title2"})
 
@@ -48,7 +50,7 @@ defmodule Ecto.Integration.RepoTest do
   end
 
   test "insert, update and delete" do
-    post = %Post{title: "create and delete single", text: "fetch empty"}
+    post = %Post{title: "insert, update, delete", text: "fetch empty"}
     meta = post.__meta__
 
     deleted_meta = put_in meta.state, :deleted
@@ -63,18 +65,51 @@ defmodule Ecto.Integration.RepoTest do
     assert post.inserted_at
   end
 
+  test "insert, update and delete with composite pk" do
+    c1 = TestRepo.insert!(%CompositePk{a: 1, b: 2, name: "first"})
+    c2 = TestRepo.insert!(%CompositePk{a: 1, b: 3, name: "second"})
+
+    assert CompositePk |> first |> TestRepo.one == c1
+    assert CompositePk |> last |> TestRepo.one == c2
+
+    changeset = Ecto.Changeset.cast(c1, %{name: "first change"}, ~w(name))
+    c1 = TestRepo.update!(changeset)
+    assert TestRepo.get_by!(CompositePk, %{a: 1, b: 2}) == c1
+
+    TestRepo.delete!(c2)
+    assert TestRepo.all(CompositePk) == [c1]
+
+    assert_raise ArgumentError, ~r"to have exactly one primary key", fn ->
+      TestRepo.get(CompositePk, [])
+    end
+
+    assert_raise ArgumentError, ~r"to have exactly one primary key", fn ->
+      TestRepo.get!(CompositePk, [1, 2])
+    end
+  end
+
+  test "insert, update and delete with associated composite pk" do
+    user = TestRepo.insert!(%User{})
+    post = TestRepo.insert!(%Post{title: "post title", text: "post text"})
+
+    user_post = TestRepo.insert!(%PostUserCompositePk{user_id: user.id, post_id: post.id})
+    assert TestRepo.get_by!(PostUserCompositePk, [user_id: user.id, post_id: post.id]) == user_post
+    TestRepo.delete!(user_post)
+    assert TestRepo.all(PostUserCompositePk) == []
+  end
+
   test "insert and update with changeset" do
     # On insert we merge the fields and changes
     changeset = Ecto.Changeset.cast(%Post{text: "x", title: "wrong"},
-                                    %{"title" => "hello", "temp" => "unknown"}, ~w(title temp), ~w())
+                                    %{"title" => "hello", "temp" => "unknown"}, ~w(title temp))
 
     post = TestRepo.insert!(changeset)
     assert %Post{text: "x", title: "hello", temp: "unknown"} = post
     assert %Post{text: "x", title: "hello", temp: "temp"} = TestRepo.get!(Post, post.id)
 
-    # On update we merge only fields, direct model changes are discarded
+    # On update we merge only fields, direct schema changes are discarded
     changeset = Ecto.Changeset.cast(%{post | text: "y"},
-                                    %{"title" => "world", "temp" => "unknown"}, ~w(title temp), ~w())
+                                    %{"title" => "world", "temp" => "unknown"}, ~w(title temp))
 
     assert %Post{text: "y", title: "world", temp: "unknown"} = TestRepo.update!(changeset)
     assert %Post{text: "x", title: "world", temp: "temp"} = TestRepo.get!(Post, post.id)
@@ -82,12 +117,12 @@ defmodule Ecto.Integration.RepoTest do
 
   test "insert and update with empty changeset" do
     # On insert we merge the fields and changes
-    changeset = Ecto.Changeset.cast(%Permalink{}, %{}, ~w(), ~w())
+    changeset = Ecto.Changeset.cast(%Permalink{}, %{}, ~w())
     assert %Permalink{} = permalink = TestRepo.insert!(changeset)
 
     # Assert we can update the same value twice,
     # without changes, without triggering stale errors.
-    changeset = Ecto.Changeset.cast(permalink, %{}, ~w(), ~w())
+    changeset = Ecto.Changeset.cast(permalink, %{}, ~w())
     assert TestRepo.update!(changeset) == permalink
     assert TestRepo.update!(changeset) == permalink
   end
@@ -100,27 +135,26 @@ defmodule Ecto.Integration.RepoTest do
   @tag :read_after_writes
   test "insert and update with changeset read after writes" do
     defmodule RAW do
-      use Ecto.Model
+      use Ecto.Schema
 
-      schema "posts" do
-        field :counter, :integer, read_after_writes: true
-        field :visits, :integer
+      schema "comments" do
+        field :text, :string
+        field :lock_version, :integer, read_after_writes: true
       end
     end
 
-    changeset = Ecto.Changeset.cast(struct(RAW, %{}), %{}, ~w(), ~w())
+    changeset = Ecto.Changeset.cast(struct(RAW, %{}), %{}, ~w())
 
-    # There is no dirty tracking on insert, even with changesets,
-    # so database defaults never actually kick in.
-    assert %{id: cid, counter: nil} = raw = TestRepo.insert!(changeset)
+    # If the field is nil, we will not send it
+    # and read the value back from the database.
+    assert %{id: cid, lock_version: 1} = raw = TestRepo.insert!(changeset)
 
     # Set the counter to 11, so we can read it soon
-    TestRepo.update_all from(u in RAW, where: u.id == ^cid), set: [counter: 11]
+    TestRepo.update_all from(u in RAW, where: u.id == ^cid), set: [lock_version: 11]
 
-    # Now, a combination of dirty tracking with read_after_writes,
-    # allow us to see the actual counter value.
-    changeset = Ecto.Changeset.cast(raw, %{"visits" => "0"}, ~w(visits), ~w())
-    assert %{id: ^cid, counter: 11, visits: 0} = TestRepo.update!(changeset)
+    # We will read back on update too
+    changeset = Ecto.Changeset.cast(raw, %{"text" => "0"}, ~w(text))
+    assert %{id: ^cid, lock_version: 11, text: "0"} = TestRepo.update!(changeset)
   end
 
   test "insert autogenerates for custom type" do
@@ -132,7 +166,7 @@ defmodule Ecto.Integration.RepoTest do
   @tag :id_type
   test "insert autogenerates for custom id type" do
     defmodule ID do
-      use Ecto.Model
+      use Ecto.Schema
 
       @primary_key {:id, Elixir.Custom.Permalink, autogenerate: true}
       schema "posts" do
@@ -153,38 +187,32 @@ defmodule Ecto.Integration.RepoTest do
   @tag :id_type
   @tag :assigns_id_type
   test "insert and update with user-assigned primary key in changeset" do
-    changeset = Ecto.Changeset.cast(%Post{id: 11}, %{"id" => "13"}, ~w(id), ~w())
+    changeset = Ecto.Changeset.cast(%Post{id: 11}, %{"id" => "13"}, ~w(id))
     assert %Post{id: 13} = post = TestRepo.insert!(changeset)
 
-    changeset = Ecto.Changeset.cast(post, %{"id" => "15"}, ~w(id), ~w())
+    changeset = Ecto.Changeset.cast(post, %{"id" => "15"}, ~w(id))
     assert %Post{id: 15} = TestRepo.update!(changeset)
   end
 
-  test "insert autogenerates for binary id type" do
-    custom = TestRepo.insert!(%Custom{bid: nil})
-    assert custom.bid
-    assert TestRepo.get(Custom, custom.bid)
-    assert TestRepo.delete!(custom)
-    refute TestRepo.get(Custom, custom.bid)
-  end
-
   @tag :uses_usec
-  test "insert and fetch a model with timestamps with usec" do
+  test "insert and fetch a schema with timestamps with usec" do
     p1 = TestRepo.insert!(%PostUsecTimestamps{title: "hello"})
     assert [p1] == TestRepo.all(PostUsecTimestamps)
   end
 
   test "optimistic locking in update/delete operations" do
-    import Ecto.Changeset, only: [cast: 4]
+    import Ecto.Changeset, only: [cast: 3, optimistic_lock: 2]
     base_post = TestRepo.insert!(%Comment{})
 
-    cs_ok = cast(base_post, %{"text" => "foo.bar"}, ~w(text), ~w())
+    cs_ok =
+      base_post
+      |> cast(%{"text" => "foo.bar"}, ~w(text))
+      |> optimistic_lock(:lock_version)
     TestRepo.update!(cs_ok)
 
-    cs_stale = cast(base_post, %{"text" => "foo.baz"}, ~w(text), ~w())
-    assert_raise Ecto.StaleModelError, fn -> TestRepo.update!(cs_stale) end
-
-    assert_raise Ecto.StaleModelError, fn -> TestRepo.delete!(base_post) end
+    cs_stale = optimistic_lock(base_post, :lock_version)
+    assert_raise Ecto.StaleEntryError, fn -> TestRepo.update!(cs_stale) end
+    assert_raise Ecto.StaleEntryError, fn -> TestRepo.delete!(cs_stale) end
   end
 
   @tag :unique_constraint
@@ -193,7 +221,7 @@ defmodule Ecto.Integration.RepoTest do
     {:ok, _}  = TestRepo.insert(changeset)
 
     exception =
-      assert_raise Ecto.ConstraintError, ~r/constraint error when attempting to insert model/, fn ->
+      assert_raise Ecto.ConstraintError, ~r/constraint error when attempting to insert struct/, fn ->
         changeset
         |> TestRepo.insert()
       end
@@ -201,7 +229,7 @@ defmodule Ecto.Integration.RepoTest do
     assert exception.message =~ "unique: posts_uuid_index"
     assert exception.message =~ "The changeset has not defined any constraint."
 
-    message = ~r/constraint error when attempting to insert model/
+    message = ~r/constraint error when attempting to insert struct/
     exception =
       assert_raise Ecto.ConstraintError, message, fn ->
         changeset
@@ -215,8 +243,24 @@ defmodule Ecto.Integration.RepoTest do
       changeset
       |> Ecto.Changeset.unique_constraint(:uuid)
       |> TestRepo.insert()
-    assert changeset.errors == [uuid: "has already been taken"]
-    assert changeset.model.__meta__.state == :built
+    assert changeset.errors == [uuid: {"has already been taken", []}]
+    assert changeset.data.__meta__.state == :built
+  end
+
+  @tag :unique_constraint
+  test "unique constraint from association" do
+    uuid = Ecto.UUID.generate()
+    post = & %Post{} |> Ecto.Changeset.change(uuid: &1) |> Ecto.Changeset.unique_constraint(:uuid)
+
+    {:error, changeset} =
+      TestRepo.insert %User{
+        comments: [%Comment{}],
+        permalink: %Permalink{},
+        posts: [post.(uuid), post.(uuid), post.(Ecto.UUID.generate)]
+      }
+
+    [_, p2, _] = changeset.changes.posts
+    assert p2.errors == [uuid: {"has already been taken", []}]
   end
 
   @tag :id_type
@@ -229,8 +273,8 @@ defmodule Ecto.Integration.RepoTest do
       changeset
       |> Ecto.Changeset.unique_constraint(:uuid)
       |> TestRepo.insert()
-    assert changeset.errors == [uuid: "has already been taken"]
-    assert changeset.model.__meta__.state == :built
+    assert changeset.errors == [uuid: {"has already been taken", []}]
+    assert changeset.data.__meta__.state == :built
   end
 
   @tag :foreign_key_constraint
@@ -238,7 +282,7 @@ defmodule Ecto.Integration.RepoTest do
     changeset = Ecto.Changeset.change(%Comment{post_id: 0})
 
     exception =
-      assert_raise Ecto.ConstraintError, ~r/constraint error when attempting to insert model/, fn ->
+      assert_raise Ecto.ConstraintError, ~r/constraint error when attempting to insert struct/, fn ->
         changeset
         |> TestRepo.insert()
       end
@@ -246,7 +290,7 @@ defmodule Ecto.Integration.RepoTest do
     assert exception.message =~ "foreign_key: comments_post_id_fkey"
     assert exception.message =~ "The changeset has not defined any constraint."
 
-    message = ~r/constraint error when attempting to insert model/
+    message = ~r/constraint error when attempting to insert struct/
     exception =
       assert_raise Ecto.ConstraintError, message, fn ->
         changeset
@@ -260,7 +304,7 @@ defmodule Ecto.Integration.RepoTest do
       changeset
       |> Ecto.Changeset.foreign_key_constraint(:post_id)
       |> TestRepo.insert()
-    assert changeset.errors == [post_id: "does not exist"]
+    assert changeset.errors == [post_id: {"does not exist", []}]
   end
 
  @tag :foreign_key_constraint
@@ -268,7 +312,7 @@ defmodule Ecto.Integration.RepoTest do
     changeset = Ecto.Changeset.change(%Comment{post_id: 0})
 
     exception =
-      assert_raise Ecto.ConstraintError, ~r/constraint error when attempting to insert model/, fn ->
+      assert_raise Ecto.ConstraintError, ~r/constraint error when attempting to insert struct/, fn ->
         changeset
         |> TestRepo.insert()
       end
@@ -276,7 +320,7 @@ defmodule Ecto.Integration.RepoTest do
     assert exception.message =~ "foreign_key: comments_post_id_fkey"
     assert exception.message =~ "The changeset has not defined any constraint."
 
-    message = ~r/constraint error when attempting to insert model/
+    message = ~r/constraint error when attempting to insert struct/
     exception =
       assert_raise Ecto.ConstraintError, message, fn ->
         changeset
@@ -290,39 +334,99 @@ defmodule Ecto.Integration.RepoTest do
       changeset
       |> Ecto.Changeset.assoc_constraint(:post)
       |> TestRepo.insert()
-    assert changeset.errors == [post: "does not exist"]
+    assert changeset.errors == [post: {"does not exist", []}]
   end
 
   @tag :foreign_key_constraint
-  test "no assoc constraint" do
+  test "no assoc constraint error" do
     user = TestRepo.insert!(%User{})
     TestRepo.insert!(%Permalink{user_id: user.id})
 
     exception =
-      assert_raise Ecto.ConstraintError, ~r/constraint error when attempting to delete model/, fn ->
+      assert_raise Ecto.ConstraintError, ~r/constraint error when attempting to delete struct/, fn ->
         TestRepo.delete!(user)
       end
 
     assert exception.message =~ "foreign_key: permalinks_user_id_fkey"
     assert exception.message =~ "The changeset has not defined any constraint."
+  end
 
-    message = ~r/constraint error when attempting to delete model/
+  @tag :foreign_key_constraint
+  test "no assoc constraint with changeset mismatch" do
+    user = TestRepo.insert!(%User{})
+    TestRepo.insert!(%Permalink{user_id: user.id})
+
+    message = ~r/constraint error when attempting to delete struct/
     exception =
       assert_raise Ecto.ConstraintError, message, fn ->
         user
         |> Ecto.Changeset.change
-        |> Ecto.Changeset.no_assoc_constraint(:permalinks, name: :permalinks_user_id_pther)
+        |> Ecto.Changeset.no_assoc_constraint(:permalink, name: :permalinks_user_id_pther)
         |> TestRepo.delete()
       end
 
     assert exception.message =~ "foreign_key: permalinks_user_id_pther"
+  end
+
+  @tag :foreign_key_constraint
+  test "no assoc constraint with changeset match" do
+    user = TestRepo.insert!(%User{})
+    TestRepo.insert!(%Permalink{user_id: user.id})
 
     {:error, changeset} =
       user
       |> Ecto.Changeset.change
-      |> Ecto.Changeset.no_assoc_constraint(:permalinks)
+      |> Ecto.Changeset.no_assoc_constraint(:permalink)
       |> TestRepo.delete()
-    assert changeset.errors == [permalinks: "are still associated to this entry"]
+    assert changeset.errors == [permalink: {"is still associated to this entry", []}]
+  end
+
+  test "insert and update with failing child foreign key" do
+    defmodule Order do
+      use Ecto.Integration.Schema
+      import Ecto.Changeset
+
+      schema "orders" do
+        embeds_one :item, Ecto.Integration.Item
+        belongs_to :comment, Ecto.Integration.Comment
+      end
+
+      def changeset(order, params) do
+        order
+        |> cast(params, [:comment_id])
+        |> cast_embed(:item, with: &item_changeset/2)
+        |> cast_assoc(:comment, with: &comment_changeset/2)
+      end
+
+      def item_changeset(item, params) do
+        item
+        |> cast(params, [:price])
+      end
+
+      def comment_changeset(comment, params) do
+        comment
+        |> cast(params, [:post_id, :text])
+        |> cast_assoc(:post)
+        |> assoc_constraint(:post)
+      end
+    end
+
+    changeset = Order.changeset(struct(Order, %{}), %{item: %{price: 10}, comment: %{text: "1", post_id: 0}})
+
+    assert %Ecto.Changeset{} = changeset.changes.item
+
+    {:error, changeset} = TestRepo.insert(changeset)
+    assert %Ecto.Changeset{} = changeset.changes.item
+
+    order = TestRepo.insert!(Order.changeset(struct(Order, %{}), %{}))
+    |> TestRepo.preload([:comment])
+
+    changeset = Order.changeset(order, %{item: %{price: 10}, comment: %{text: "1", post_id: 0}})
+
+    assert %Ecto.Changeset{} = changeset.changes.item
+
+    {:error, changeset} = TestRepo.update(changeset)
+    assert %Ecto.Changeset{} = changeset.changes.item
   end
 
   test "get(!)" do
@@ -344,7 +448,7 @@ defmodule Ecto.Integration.RepoTest do
   end
 
   test "get(!) with custom source" do
-    custom = Ecto.Model.put_meta(%Custom{}, source: "posts")
+    custom = Ecto.put_meta(%Custom{}, source: "posts")
     custom = TestRepo.insert!(custom)
     bid    = custom.bid
     assert %Custom{bid: ^bid, __meta__: %{source: {nil, "posts"}}} =
@@ -367,38 +471,124 @@ defmodule Ecto.Integration.RepoTest do
     assert post1 == TestRepo.get_by!(Post, id: post1.id, text: post1.text)
     assert post2 == TestRepo.get_by!(Post, id: to_string(post2.id)) # With casting
 
+    assert post1 == TestRepo.get_by!(Post, %{id: post1.id})
+
     assert_raise Ecto.NoResultsError, fn ->
       TestRepo.get_by!(Post, id: post2.id, text: "hey")
     end
   end
 
-  test "one(!)" do
+  test "first, last and one(!)" do
     post1 = TestRepo.insert!(%Post{title: "1", text: "hai"})
     post2 = TestRepo.insert!(%Post{title: "2", text: "hai"})
 
-    assert post1 == TestRepo.one(from p in Post, where: p.id == ^post1.id)
-    assert post2 == TestRepo.one(from p in Post, where: p.id == ^to_string post2.id) # With casting
-    assert nil   == TestRepo.one(from p in Post, where: is_nil(p.id))
+    assert post1 == Post |> first |> TestRepo.one
+    assert post2 == Post |> last |> TestRepo.one
 
-    assert post1 == TestRepo.one!(from p in Post, where: p.id == ^post1.id)
-    assert post2 == TestRepo.one!(from p in Post, where: p.id == ^to_string post2.id) # With casting
+    query = from p in Post, order_by: p.title
+    assert post1 == query |> first |> TestRepo.one
+    assert post2 == query |> last |> TestRepo.one
 
-    assert_raise Ecto.NoResultsError, fn ->
-      TestRepo.one!(from p in Post, where: is_nil(p.id))
+    query = from p in Post, order_by: [desc: p.title], limit: 10
+    assert post2 == query |> first |> TestRepo.one
+    assert post1 == query |> last |> TestRepo.one
+
+    query = from p in Post, where: is_nil(p.id)
+    refute query |> first |> TestRepo.one
+    refute query |> first |> TestRepo.one
+    assert_raise Ecto.NoResultsError, fn -> query |> first |> TestRepo.one! end
+    assert_raise Ecto.NoResultsError, fn -> query |> last |> TestRepo.one! end
+  end
+
+  test "aggregate" do
+    assert TestRepo.aggregate(Post, :max, :visits) == nil
+
+    TestRepo.insert!(%Post{visits: 10})
+    TestRepo.insert!(%Post{visits: 12})
+    TestRepo.insert!(%Post{visits: 14})
+    TestRepo.insert!(%Post{visits: 14})
+
+    # Barebones
+    assert TestRepo.aggregate(Post, :max, :visits) == 14
+    assert TestRepo.aggregate(Post, :min, :visits) == 10
+    assert TestRepo.aggregate(Post, :count, :visits) == 4
+    assert "50" = to_string(TestRepo.aggregate(Post, :sum, :visits))
+    assert "12.5" <> _ = to_string(TestRepo.aggregate(Post, :avg, :visits))
+
+    # With order_by
+    query = from Post, order_by: [asc: :visits]
+    assert TestRepo.aggregate(query, :max, :visits) == 14
+
+    # With order_by and limit
+    query = from Post, order_by: [asc: :visits], limit: 2
+    assert TestRepo.aggregate(query, :max, :visits) == 12
+
+    # With distinct
+    query = from Post, order_by: [asc: :visits], distinct: true
+    assert TestRepo.aggregate(query, :count, :visits) == 3
+  end
+
+  test "insert all" do
+    assert {2, nil} = TestRepo.insert_all("comments", [[text: "1"], %{text: "2", lock_version: 2}])
+    assert {2, nil} = TestRepo.insert_all({nil, "comments"}, [[text: "3"], %{text: "4", lock_version: 2}])
+    assert [%Comment{text: "1", lock_version: 1},
+            %Comment{text: "2", lock_version: 2},
+            %Comment{text: "3", lock_version: 1},
+            %Comment{text: "4", lock_version: 2}] = TestRepo.all(Comment)
+
+    assert {2, nil} = TestRepo.insert_all(Post, [[], []])
+    assert [%Post{}, %Post{}] = TestRepo.all(Post)
+
+    assert {0, nil} = TestRepo.insert_all("posts", [])
+    assert {0, nil} = TestRepo.insert_all({nil, "posts"}, [])
+  end
+
+  @tag :returning
+  test "insert all with returning with schema" do
+    assert {0, []} = TestRepo.insert_all(Comment, [], returning: true)
+    assert {0, nil} = TestRepo.insert_all(Comment, [], returning: false)
+
+    {2, [c1, c2]} = TestRepo.insert_all(Comment, [[text: "1"], [text: "2"]], returning: [:id, :text])
+    assert %Comment{text: "1", __meta__: %{state: :loaded}} = c1
+    assert %Comment{text: "2", __meta__: %{state: :loaded}} = c2
+
+    {2, [c1, c2]} = TestRepo.insert_all(Comment, [[text: "3"], [text: "4"]], returning: true)
+    assert %Comment{text: "3", __meta__: %{state: :loaded}} = c1
+    assert %Comment{text: "4", __meta__: %{state: :loaded}} = c2
+  end
+
+  @tag :returning
+  test "insert all with returning without schema" do
+    {2, [c1, c2]} = TestRepo.insert_all("comments", [[text: "1"], [text: "2"]], returning: [:id, :text])
+    assert %{id: _, text: "1"} = c1
+    assert %{id: _, text: "2"} = c2
+
+    assert_raise ArgumentError, fn ->
+      TestRepo.insert_all("comments", [[text: "1"], [text: "2"]], returning: true)
     end
   end
 
-  test "one(!) with multiple results" do
-    assert %Post{} = TestRepo.insert!(%Post{title: "hai"})
-    assert %Post{} = TestRepo.insert!(%Post{title: "hai"})
+  test "insert all with dumping" do
+    date = Ecto.DateTime.utc
+    assert {2, nil} = TestRepo.insert_all(Post, [%{inserted_at: date}, %{title: "date"}])
+    assert [%Post{inserted_at: ^date, title: nil},
+            %Post{inserted_at: nil, title: "date"}] = TestRepo.all(Post)
+  end
 
-    assert_raise Ecto.MultipleResultsError, fn ->
-      TestRepo.one(from p in Post, where: p.title == "hai")
-    end
+  test "insert all autogenerates for binary id type" do
+    custom = TestRepo.insert!(%Custom{bid: nil})
+    assert custom.bid
+    assert TestRepo.get(Custom, custom.bid)
+    assert TestRepo.delete!(custom)
+    refute TestRepo.get(Custom, custom.bid)
 
-    assert_raise Ecto.MultipleResultsError, fn ->
-      TestRepo.one!(from p in Post, where: p.title == "hai")
-    end
+    uuid = Ecto.UUID.generate
+    assert {2, nil} = TestRepo.insert_all(Custom, [%{uuid: uuid}, %{bid: custom.bid}])
+    assert [%Custom{bid: bid2, uuid: nil},
+            %Custom{bid: bid1, uuid: ^uuid}] = Enum.sort_by(TestRepo.all(Custom), & &1.uuid)
+    assert bid1 && bid2
+    assert custom.bid != bid1
+    assert custom.bid == bid2
   end
 
   test "update all" do
@@ -412,11 +602,46 @@ defmodule Ecto.Integration.RepoTest do
     assert %Post{title: "x"} = TestRepo.get(Post, id2)
     assert %Post{title: "x"} = TestRepo.get(Post, id3)
 
-    assert {3, nil} = TestRepo.update_all("posts", set: [title: nil])
+    assert {3, nil} = TestRepo.update_all("posts", [set: [title: nil]], returning: false)
 
     assert %Post{title: nil} = TestRepo.get(Post, id1)
     assert %Post{title: nil} = TestRepo.get(Post, id2)
     assert %Post{title: nil} = TestRepo.get(Post, id3)
+  end
+
+  @tag :returning
+  test "update all with returning with schema" do
+    assert %Post{id: id1} = TestRepo.insert!(%Post{title: "1"})
+    assert %Post{id: id2} = TestRepo.insert!(%Post{title: "2"})
+    assert %Post{id: id3} = TestRepo.insert!(%Post{title: "3"})
+
+    assert {3, posts} = TestRepo.update_all(Post, [set: [title: "x"]], returning: true)
+
+    [p1, p2, p3] = Enum.sort_by(posts, & &1.id)
+    assert %Post{id: ^id1, title: "x"} = p1
+    assert %Post{id: ^id2, title: "x"} = p2
+    assert %Post{id: ^id3, title: "x"} = p3
+
+    assert {3, posts} = TestRepo.update_all(Post, [set: [visits: 11]], returning: [:id, :visits])
+
+    [p1, p2, p3] = Enum.sort_by(posts, & &1.id)
+    assert %Post{id: ^id1, title: nil, visits: 11} = p1
+    assert %Post{id: ^id2, title: nil, visits: 11} = p2
+    assert %Post{id: ^id3, title: nil, visits: 11} = p3
+  end
+
+  @tag :returning
+  test "update all with returning without schema" do
+    assert %Post{id: id1} = TestRepo.insert!(%Post{title: "1"})
+    assert %Post{id: id2} = TestRepo.insert!(%Post{title: "2"})
+    assert %Post{id: id3} = TestRepo.insert!(%Post{title: "3"})
+
+    assert {3, posts} = TestRepo.update_all("posts", [set: [title: "x"]], returning: [:id, :title])
+
+    [p1, p2, p3] = Enum.sort_by(posts, & &1.id)
+    assert p1 == %{id: id1, title: "x"}
+    assert p2 == %{id: id2, title: "x"}
+    assert p3 == %{id: id3, title: "x"}
   end
 
   test "update all with filter" do
@@ -486,8 +711,36 @@ defmodule Ecto.Integration.RepoTest do
     assert %Post{} = TestRepo.insert!(%Post{title: "2", text: "hai"})
     assert %Post{} = TestRepo.insert!(%Post{title: "3", text: "hai"})
 
-    assert {3, nil} = TestRepo.delete_all(Post)
+    assert {3, nil} = TestRepo.delete_all(Post, returning: false)
     assert [] = TestRepo.all(Post)
+  end
+
+  @tag :returning
+  test "delete all with returning with schema" do
+    assert %Post{id: id1} = TestRepo.insert!(%Post{title: "1", text: "hai"})
+    assert %Post{id: id2} = TestRepo.insert!(%Post{title: "2", text: "hai"})
+    assert %Post{id: id3} = TestRepo.insert!(%Post{title: "3", text: "hai"})
+
+    assert {3, posts} = TestRepo.delete_all(Post, returning: true)
+
+    [p1, p2, p3] = Enum.sort_by(posts, & &1.id)
+    assert %Post{id: ^id1, title: "1"} = p1
+    assert %Post{id: ^id2, title: "2"} = p2
+    assert %Post{id: ^id3, title: "3"} = p3
+  end
+
+  @tag :returning
+  test "delete all with returning without schema" do
+    assert %Post{id: id1} = TestRepo.insert!(%Post{title: "1", text: "hai"})
+    assert %Post{id: id2} = TestRepo.insert!(%Post{title: "2", text: "hai"})
+    assert %Post{id: id3} = TestRepo.insert!(%Post{title: "3", text: "hai"})
+
+    assert {3, posts} = TestRepo.delete_all("posts", returning: [:id, :title])
+
+    [p1, p2, p3] = Enum.sort_by(posts, & &1.id)
+    assert p1 == %{id: id1, title: "1"}
+    assert p2 == %{id: id2, title: "2"}
+    assert p3 == %{id: id3, title: "3"}
   end
 
   test "delete all with filter" do
@@ -517,190 +770,150 @@ defmodule Ecto.Integration.RepoTest do
     assert TestRepo.get(Post, id).temp == "temp"
   end
 
-  ## Assocs
+  ## Query syntax
 
-  test "has_many assoc" do
-    p1 = TestRepo.insert!(%Post{title: "1"})
-    p2 = TestRepo.insert!(%Post{title: "1"})
+  test "query select expressions" do
+    %Post{} = TestRepo.insert!(%Post{title: "1", text: "hai"})
 
-    %Comment{id: cid1} = TestRepo.insert!(%Comment{text: "1", post_id: p1.id})
-    %Comment{id: cid2} = TestRepo.insert!(%Comment{text: "2", post_id: p1.id})
-    %Comment{id: cid3} = TestRepo.insert!(%Comment{text: "3", post_id: p2.id})
+    assert [{"1", "hai"}] ==
+           TestRepo.all(from p in Post, select: {p.title, p.text})
 
-    [c1, c2] = TestRepo.all Ecto.Model.assoc(p1, :comments)
-    assert c1.id == cid1
-    assert c2.id == cid2
+    assert [["1", "hai"]] ==
+           TestRepo.all(from p in Post, select: [p.title, p.text])
 
-    [c1, c2, c3] = TestRepo.all Ecto.Model.assoc([p1, p2], :comments)
-    assert c1.id == cid1
-    assert c2.id == cid2
-    assert c3.id == cid3
+    assert [%{:title => "1", 3 => "hai", "text" => "hai"}] ==
+           TestRepo.all(from p in Post, select: %{
+             :title => p.title,
+             "text" => p.text,
+             3 => p.text
+           })
+
+    assert [%{:title => "1", "1" => "hai", "text" => "hai"}] ==
+           TestRepo.all(from p in Post, select: %{
+             :title  => p.title,
+             p.title => p.text,
+             "text"  => p.text
+           })
   end
 
-  test "has_one assoc" do
-    p1 = TestRepo.insert!(%Post{title: "1"})
-    p2 = TestRepo.insert!(%Post{title: "2"})
+  test "query select map update" do
+    %Post{} = TestRepo.insert!(%Post{title: "1", text: "hai"})
 
-    %Permalink{id: lid1} = TestRepo.insert!(%Permalink{url: "1", post_id: p1.id})
-    %Permalink{}         = TestRepo.insert!(%Permalink{url: "2"})
-    %Permalink{id: lid3} = TestRepo.insert!(%Permalink{url: "3", post_id: p2.id})
+    assert [%Post{:title => "new title", text: "hai"}] =
+           TestRepo.all(from p in Post, select: %{p | title: "new title"})
 
-    [l1, l3] = TestRepo.all Ecto.Model.assoc([p1, p2], :permalink)
-    assert l1.id == lid1
-    assert l3.id == lid3
-  end
-
-  test "belongs_to assoc" do
-    %Post{id: pid1} = TestRepo.insert!(%Post{title: "1"})
-    %Post{id: pid2} = TestRepo.insert!(%Post{title: "2"})
-
-    l1 = TestRepo.insert!(%Permalink{url: "1", post_id: pid1})
-    l2 = TestRepo.insert!(%Permalink{url: "2"})
-    l3 = TestRepo.insert!(%Permalink{url: "3", post_id: pid2})
-
-    assert [p1, p2] = TestRepo.all Ecto.Model.assoc([l1, l2, l3], :post)
-    assert p1.id == pid1
-    assert p2.id == pid2
-  end
-
-  test "has_one nested assoc" do
-    changeset = Ecto.Changeset.change(%Post{title: "1"}, permalink: %Permalink{url: "1"})
-    p1 = TestRepo.insert!(changeset)
-    assert p1.permalink.id
-    assert p1.permalink.post_id == p1.id
-    assert p1.permalink.url == "1"
-    p1 = TestRepo.get!(from(p in Post, preload: [:permalink]), p1.id)
-    assert p1.permalink.url == "1"
-
-    changeset = Ecto.Changeset.change(p1, permalink: %Permalink{url: "2"})
-    p1 = TestRepo.update!(changeset)
-    assert p1.permalink.id
-    assert p1.permalink.post_id == p1.id
-    assert p1.permalink.url == "2"
-    p1 = TestRepo.get!(from(p in Post, preload: [:permalink]), p1.id)
-    assert p1.permalink.url == "2"
-
-    changeset = Ecto.Changeset.change(p1, permalink: nil)
-    p1 = TestRepo.update!(changeset)
-    refute p1.permalink
-    p1 = TestRepo.get!(from(p in Post, preload: [:permalink]), p1.id)
-    refute p1.permalink
-
-    assert [0] == TestRepo.all(from(p in Permalink, select: count(p.id)))
-  end
-
-  test "has_many nested assoc" do
-    c1 = %Comment{text: "1"}
-    c2 = %Comment{text: "2"}
-
-    changeset = Ecto.Changeset.change(%Post{title: "1"}, comments: [c1])
-    p1 = TestRepo.insert!(changeset)
-    [c1] = p1.comments
-    assert c1.id
-    assert c1.post_id == p1.id
-    p1 = TestRepo.get!(from(p in Post, preload: [:comments]), p1.id)
-    [c1] = p1.comments
-    assert c1.text == "1"
-
-    changeset = Ecto.Changeset.change(p1, comments: [c1, c2])
-    p1 = TestRepo.update!(changeset)
-    [_c1, c2] = p1.comments |> Enum.sort_by(&(&1.id))
-    assert c2.id
-    assert c2.post_id == p1.id
-    p1 = TestRepo.get!(from(p in Post, preload: [:comments]), p1.id)
-    [c1, c2] = p1.comments |> Enum.sort_by(&(&1.id))
-    assert c1.text == "1"
-    assert c2.text == "2"
-
-    changeset = Ecto.Changeset.change(p1, comments: [])
-    p1 = TestRepo.update!(changeset)
-    assert p1.comments == []
-    p1 = TestRepo.get!(from(p in Post, preload: [:comments]), p1.id)
-    assert p1.comments == []
-
-    assert [0] == TestRepo.all(from(c in Comment, select: count(c.id)))
-  end
-
-  @tag :unique_constraint
-  test "has_many assoc with constraints" do
-    author = TestRepo.insert!(%User{name: "john doe"})
-    p1 = TestRepo.insert!(%Post{title: "hello", author_id: author.id})
-    TestRepo.insert!(%Post{title: "world", author_id: author.id})
-
-    # Asserts that `unique_constraint` for `uuid` exists
-    assert_raise Ecto.ConstraintError, fn ->
-      TestRepo.insert!(%Post{title: "another", author_id: author.id, uuid: p1.uuid})
+    assert_raise KeyError, fn ->
+      TestRepo.all(from p in Post, select: %{p | unknown: "new title"})
     end
 
-    author = TestRepo.preload author, [:posts]
-    posts_params = Enum.map author.posts, fn %Post{uuid: u} ->
-      %{"uuid": u, "title": "fresh"}
+    assert_raise BadMapError, fn ->
+      TestRepo.all(from p in Post, select: %{p.title | title: "new title"})
     end
-
-    # This will only work if we delete before performing inserts
-    changeset = Ecto.Changeset.cast(author, %{"posts" => posts_params}, ~w(posts))
-    author = TestRepo.update! changeset
-    assert Enum.map(author.posts, &(&1.title)) == ["fresh", "fresh"]
   end
 
-  @tag :transaction
-  test "rollbacks failed nested assocs" do
-    permalink_changeset = %{Ecto.Changeset.change(%Permalink{url: "1"}) | valid?: false}
-    changeset = Ecto.Changeset.change(%Post{title: "1"}, permalink: permalink_changeset)
-    assert {:error, changeset} = TestRepo.insert(changeset)
-    assert changeset.model.__struct__ == Post
-    refute changeset.valid?
-    assert [0] == TestRepo.all(from(p in Post, select: count(p.id)))
-    assert [0] == TestRepo.all(from(p in Permalink, select: count(p.id)))
+  test "query select take with structs" do
+    %{id: pid1} = TestRepo.insert!(%Post{title: "1"})
+    %{id: pid2} = TestRepo.insert!(%Post{title: "2"})
+    %{id: pid3} = TestRepo.insert!(%Post{title: "3"})
+
+    [p1, p2, p3] = Post |> select([p], struct(p, [:title])) |> order_by([:title]) |> TestRepo.all
+    refute p1.id
+    assert p1.title == "1"
+    assert match?(%Post{}, p1)
+    refute p2.id
+    assert p2.title == "2"
+    assert match?(%Post{}, p2)
+    refute p3.id
+    assert p3.title == "3"
+    assert match?(%Post{}, p3)
+
+    [p1, p2, p3] = Post |> select([:id]) |> order_by([:id]) |> TestRepo.all
+    assert %Post{id: ^pid1} = p1
+    assert %Post{id: ^pid2} = p2
+    assert %Post{id: ^pid3} = p3
   end
 
-  ## Dependent
+  test "query select take with maps" do
+    %{id: pid1} = TestRepo.insert!(%Post{title: "1"})
+    %{id: pid2} = TestRepo.insert!(%Post{title: "2"})
+    %{id: pid3} = TestRepo.insert!(%Post{title: "3"})
 
-  test "has_many assoc on delete deletes all" do
-    post = TestRepo.insert!(%Post{})
-    TestRepo.insert!(%Comment{post_id: post.id})
-    TestRepo.insert!(%Comment{post_id: post.id})
-    TestRepo.delete!(post)
+    [p1, p2, p3] = "posts" |> select([p], map(p, [:title])) |> order_by([:title]) |> TestRepo.all
+    assert p1 == %{title: "1"}
+    assert p2 == %{title: "2"}
+    assert p3 == %{title: "3"}
 
-    assert TestRepo.all(Comment) == []
-    refute Process.get(Comment)
+    [p1, p2, p3] = "posts" |> select([:id]) |> order_by([:id]) |> TestRepo.all
+    assert p1 == %{id: pid1}
+    assert p2 == %{id: pid2}
+    assert p3 == %{id: pid3}
   end
 
-  test "has_many assoc on delete fetches and deletes" do
-    post = TestRepo.insert!(%Post{})
-    TestRepo.insert!(%Permalink{post_id: post.id})
-    TestRepo.delete!(post)
+  test "query select take with assocs" do
+    %{id: pid} = TestRepo.insert!(%Post{title: "post"})
+    TestRepo.insert!(%Comment{post_id: pid, text: "comment"})
 
-    assert TestRepo.all(Permalink) == []
-    assert Process.get(Permalink) == :on_delete
+    fields = [:id, :title, comments: [:text, :post_id]]
+
+    [p] = Post |> preload(:comments) |> select([p], ^fields) |> TestRepo.all
+    assert match?(%Post{title: "post"}, p)
+    assert match?([%Comment{text: "comment"}], p.comments)
+
+    [p] = Post |> preload(:comments) |> select([p], struct(p, ^fields)) |> TestRepo.all
+    assert match?(%Post{title: "post"}, p)
+    assert match?([%Comment{text: "comment"}], p.comments)
+
+    [p] = Post |> preload(:comments) |> select([p], map(p, ^fields)) |> TestRepo.all
+    assert p == %{id: pid, title: "post", comments: [%{text: "comment", post_id: pid}]}
   end
 
-  test "has_many assoc on delete nilifies all" do
-    user = TestRepo.insert!(%User{})
-    TestRepo.insert!(%Comment{author_id: user.id})
-    TestRepo.insert!(%Comment{author_id: user.id})
-    TestRepo.delete!(user)
-
-    author_ids = Comment |> TestRepo.all() |> Enum.map(fn(comment) -> comment.author_id end)
-
-    assert author_ids == [nil, nil]
-    refute Process.get(Comment)
-  end
-
-  test "has_many assoc on delete does nothing" do
-    user = TestRepo.insert!(%User{})
-    TestRepo.insert!(%Post{author_id: user.id})
-
-    TestRepo.delete!(user)
-    assert Enum.count(TestRepo.all(Post)) == 1
-  end
-
-  test "count distinct" do
+  test "query count distinct" do
     TestRepo.insert!(%Post{title: "1"})
     TestRepo.insert!(%Post{title: "1"})
     TestRepo.insert!(%Post{title: "2"})
 
     assert [3] == Post |> select([p], count(p.title)) |> TestRepo.all
     assert [2] == Post |> select([p], count(p.title, :distinct)) |> TestRepo.all
+  end
+
+  test "query where interpolation" do
+    post1 = TestRepo.insert!(%Post{text: "x", title: "hello"  })
+    post2 = TestRepo.insert!(%Post{text: "y", title: "goodbye"})
+
+    assert [post1, post2] == Post |> where([], []) |> TestRepo.all |> Enum.sort_by(& &1.id)
+    assert [post1]        == Post |> where([], [title: "hello"]) |> TestRepo.all
+    assert [post1]        == Post |> where([], [title: "hello", id: ^post1.id]) |> TestRepo.all
+
+    params0 = []
+    params1 = [title: "hello"]
+    params2 = [title: "hello", id: post1.id]
+    assert [post1, post2]  == (from Post, where: ^params0) |> TestRepo.all |> Enum.sort_by(& &1.id)
+    assert [post1]         == (from Post, where: ^params1) |> TestRepo.all
+    assert [post1]         == (from Post, where: ^params2) |> TestRepo.all
+
+    post3 = TestRepo.insert!(%Post{text: "y", title: "goodbye", uuid: nil})
+    params3 = [title: "goodbye", uuid: post3.uuid]
+    assert [post3] == (from Post, where: ^params3) |> TestRepo.all
+  end
+
+  ## Logging
+
+  test "log entry logged on query" do
+    log = fn entry ->
+      assert %Ecto.LogEntry{result: {:ok, _}} = entry
+      assert is_integer(entry.query_time) and entry.query_time >= 0
+      assert is_integer(entry.decode_time) and entry.query_time >= 0
+      assert is_integer(entry.queue_time) and entry.queue_time >= 0
+      send(self(), :logged)
+    end
+    Process.put(:on_log, log)
+
+    _ = TestRepo.all(Post)
+    assert_received :logged
+  end
+
+  test "log entry not logged when log is false" do
+    Process.put(:on_log, fn _ -> flunk("logged") end)
+    TestRepo.insert!(%Post{title: "1"}, [log: false])
   end
 end

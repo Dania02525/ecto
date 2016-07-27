@@ -1,38 +1,57 @@
-if Code.ensure_loaded?(Mariaex.Connection) do
+if Code.ensure_loaded?(Mariaex) do
 
   defmodule Ecto.Adapters.MySQL.Connection do
     @moduledoc false
 
     @default_port 3306
-    @behaviour Ecto.Adapters.Connection
-    @behaviour Ecto.Adapters.SQL.Query
+    @behaviour Ecto.Adapters.SQL.Connection
 
     ## Connection
 
-    def connect(opts) do
-      opts = Keyword.update(opts, :port, @default_port, &normalize_port/1)
-      Mariaex.Connection.start_link(opts)
+    def child_spec(opts) do
+      opts =
+        opts
+        |> Keyword.update(:port, @default_port, &normalize_port/1)
+
+      Mariaex.child_spec(opts)
     end
 
-    def query(conn, sql, params, opts \\ []) do
-      params = Enum.map params, fn
-        %Ecto.Query.Tagged{value: value} -> value
-        %{__struct__: _} = value -> value
-        %{} = value -> json_library.encode!(value)
-        value -> value
-      end
+    # TODO: Remove this on 2.1 (normalization should happen on the adapter)
+    defp normalize_port(port) when is_binary(port), do: String.to_integer(port)
+    defp normalize_port(port) when is_integer(port), do: port
 
-      case Mariaex.Connection.query(conn, sql, params, opts) do
-        {:ok, res}        -> {:ok, Map.from_struct(res)}
+    ## Query
+
+    def prepare_execute(conn, name, sql, params, opts) do
+      query = %Mariaex.Query{name: name, statement: sql}
+      DBConnection.prepare_execute(conn, query, map_params(params), opts)
+    end
+
+    def execute(conn, sql, params, opts) when is_binary(sql) do
+      query = %Mariaex.Query{name: "", statement: sql}
+      case DBConnection.prepare_execute(conn, query, map_params(params), opts) do
+        {:ok, _, query} -> {:ok, query}
         {:error, _} = err -> err
       end
     end
 
-    defp normalize_port(port) when is_binary(port), do: String.to_integer(port)
-    defp normalize_port(port) when is_integer(port), do: port
+    def execute(conn, %{} = query, params, opts) do
+      DBConnection.execute(conn, query, map_params(params), opts)
+    end
+
+    defp map_params(params) do
+      Enum.map params, fn
+        %{__struct__: _} = value ->
+          value
+        %{} = value ->
+          json_library().encode!(value)
+        value ->
+          value
+      end
+    end
 
     defp json_library do
-      Application.get_env(:ecto, :json_library)
+      Application.fetch_env!(:ecto, :json_library)
     end
 
     def to_constraints(%Mariaex.Error{mariadb: %{code: 1062, message: message}}) do
@@ -57,28 +76,6 @@ if Code.ensure_loaded?(Mariaex.Connection) do
       unquoted
     end
 
-    ## Transaction
-
-    def begin_transaction do
-      "BEGIN"
-    end
-
-    def rollback do
-      "ROLLBACK"
-    end
-
-    def commit do
-      "COMMIT"
-    end
-
-    def savepoint(savepoint) do
-      "SAVEPOINT " <> savepoint
-    end
-
-    def rollback_to_savepoint(savepoint) do
-      "ROLLBACK TO SAVEPOINT " <> savepoint
-    end
-
     ## Query
 
     alias Ecto.Query
@@ -89,7 +86,7 @@ if Code.ensure_loaded?(Mariaex.Connection) do
     def all(query) do
       sources = create_names(query)
 
-      from     = from(sources)
+      from     = from(query, sources)
       select   = select(query, sources)
       join     = join(query, sources)
       where    = where(query, sources)
@@ -103,37 +100,49 @@ if Code.ensure_loaded?(Mariaex.Connection) do
       assemble([select, from, join, where, group_by, having, order_by, limit, offset, lock])
     end
 
-    def update_all(query) do
+    def update_all(%{from: from, select: nil} = query) do
       sources = create_names(query)
-      {table, name, _model} = elem(sources, 0)
+      {from, name} = get_source(query, sources, 0, from)
 
-      update = "UPDATE #{table} AS #{name}"
+      update = "UPDATE #{from} AS #{name}"
       fields = update_fields(query, sources)
       join   = join(query, sources)
       where  = where(query, sources)
 
       assemble([update, join, "SET", fields, where])
     end
+    def update_all(_query),
+      do: error!(nil, "RETURNING is not supported in update_all by MySQL")
 
-    def delete_all(query) do
+    def delete_all(%{select: nil} = query) do
       sources = create_names(query)
-      {_table, name, _model} = elem(sources, 0)
+      {_, name, _} = elem(sources, 0)
 
       delete = "DELETE #{name}.*"
-      from   = from(sources)
+      from   = from(query, sources)
       join   = join(query, sources)
       where  = where(query, sources)
 
       assemble([delete, from, join, where])
     end
+    def delete_all(_query),
+      do: error!(nil, "RETURNING is not supported in delete_all by MySQL")
 
-    def insert(prefix, table, [], _returning),
-      do: "INSERT INTO #{quote_table(prefix, table)} () VALUES ()"
-    def insert(prefix, table, fields, _returning) do
-      values = ~s{(#{Enum.map_join(fields, ", ", &quote_name/1)}) } <>
-               ~s{VALUES (#{Enum.map_join(1..length(fields), ", ", fn (_) -> "?" end)})}
+    def insert(prefix, table, header, rows, []) do
+      fields = Enum.map_join(header, ",", &quote_name/1)
+      "INSERT INTO #{quote_table(prefix, table)} (" <> fields <> ") VALUES " <> insert_all(rows)
+    end
+    def insert(_prefix, _table, _header, _rows, _returning),
+      do: error!(nil, "RETURNING is not supported in insert_all by MySQL")
 
-      "INSERT INTO #{quote_table(prefix, table)} " <> values
+    defp insert_all(rows) do
+      Enum.map_join(rows, ",", fn row ->
+        row = Enum.map_join(row, ",", fn
+          nil -> "DEFAULT"
+          _   -> "?"
+        end)
+        "(" <> row <> ")"
+      end)
     end
 
     def update(prefix, table, fields, filters, _returning) do
@@ -162,8 +171,7 @@ if Code.ensure_loaded?(Mariaex.Connection) do
 
     binary_ops =
       [==: "=", !=: "!=", <=: "<=", >=: ">=", <:  "<", >:  ">",
-       and: "AND", or: "OR",
-       ilike: "ILIKE", like: "LIKE"]
+       and: "AND", or: "OR", like: "LIKE"]
 
     @binary_ops Keyword.keys(binary_ops)
 
@@ -177,7 +185,7 @@ if Code.ensure_loaded?(Mariaex.Connection) do
                 sources) do
       "SELECT " <>
         distinct(distinct, sources, query) <>
-        Enum.map_join(fields, ", ", &expr(&1, sources, query))
+        select(fields, sources, query)
     end
 
     defp distinct(nil, _sources, _query), do: ""
@@ -187,9 +195,14 @@ if Code.ensure_loaded?(Mariaex.Connection) do
       error!(query, "DISTINCT with multiple columns is not supported by MySQL")
     end
 
-    defp from(sources) do
-      {table, name, _model} = elem(sources, 0)
-      "FROM #{table} AS #{name}"
+    defp select([], _sources, _query),
+      do: "TRUE"
+    defp select(fields, sources, query),
+      do: Enum.map_join(fields, ", ", &expr(&1, sources, query))
+
+    defp from(%{from: from} = query, sources) do
+      {from, name} = get_source(query, sources, 0, from)
+      "FROM #{from} AS #{name}"
     end
 
     defp update_fields(%Query{updates: updates} = query, sources) do
@@ -216,17 +229,17 @@ if Code.ensure_loaded?(Mariaex.Connection) do
     defp join(%Query{joins: joins} = query, sources) do
       Enum.map_join(joins, " ", fn
         %JoinExpr{on: %QueryExpr{expr: expr}, qual: qual, ix: ix, source: source} ->
-          {join, name, _model} = elem(sources, ix)
-          qual = join_qual(qual)
-          join = join || "(" <> expr(source, sources, query) <> ")"
-          "#{qual} JOIN " <> join <> " AS #{name} ON " <> expr(expr, sources, query)
+          {join, name} = get_source(query, sources, ix, source)
+          qual = join_qual(qual, query)
+          "#{qual} " <> join <> " AS #{name} ON " <> expr(expr, sources, query)
       end)
     end
 
-    defp join_qual(:inner), do: "INNER"
-    defp join_qual(:left),  do: "LEFT OUTER"
-    defp join_qual(:right), do: "RIGHT OUTER"
-    defp join_qual(:full),  do: "FULL OUTER"
+    defp join_qual(:inner, _), do: "INNER JOIN"
+    defp join_qual(:left, _),  do: "LEFT OUTER JOIN"
+    defp join_qual(:right, _), do: "RIGHT OUTER JOIN"
+    defp join_qual(:full, _),  do: "FULL OUTER JOIN"
+    defp join_qual(mode, q),   do: error!(q, "join `#{inspect mode}` not supported by MySQL")
 
     defp where(%Query{wheres: wheres} = query, sources) do
       boolean("WHERE", wheres, sources, query)
@@ -302,15 +315,14 @@ if Code.ensure_loaded?(Mariaex.Connection) do
       "#{name}.#{quote_name(field)}"
     end
 
-    defp expr({:&, _, [idx]}, sources, query) do
-      {table, name, model} = elem(sources, idx)
-      unless model do
-        error!(query, "MySQL requires a model when using selector " <>
-          "#{inspect name} but only the table #{inspect table} was given. " <>
-          "Please specify a model or specify exactly which fields from " <>
+    defp expr({:&, _, [idx, fields, _counter]}, sources, query) do
+      {_, name, schema} = elem(sources, idx)
+      if is_nil(schema) and is_nil(fields) do
+        error!(query, "MySQL requires a schema module when using selector " <>
+          "#{inspect name} but none was given. " <>
+          "Please specify a schema or specify exactly which fields from " <>
           "#{inspect name} you desire")
       end
-      fields = model.__schema__(:fields)
       Enum.map_join(fields, ", ", &"#{name}.#{quote_name(&1)}")
     end
 
@@ -323,8 +335,12 @@ if Code.ensure_loaded?(Mariaex.Connection) do
       expr(left, sources, query) <> " IN (" <> args <> ")"
     end
 
-    defp expr({:in, _, [left, {:^, _, [ix, length]}]}, sources, query) do
-      args = Enum.map_join(ix+1..ix+length, ",", fn (_) -> "?" end)
+    defp expr({:in, _, [_, {:^, _, [_, 0]}]}, _sources, _query) do
+      "false"
+    end
+
+    defp expr({:in, _, [left, {:^, _, [_, length]}]}, sources, query) do
+      args = Enum.join List.duplicate("?", length), ","
       expr(left, sources, query) <> " IN (" <> args <> ")"
     end
 
@@ -338,6 +354,10 @@ if Code.ensure_loaded?(Mariaex.Connection) do
 
     defp expr({:not, _, [expr]}, sources, query) do
       "NOT (" <> expr(expr, sources, query) <> ")"
+    end
+
+    defp expr(%Ecto.SubQuery{query: query}, _sources, _query) do
+      all(query)
     end
 
     defp expr({:fragment, _, [kw]}, _sources, query) when is_list(kw) or tuple_size(kw) == 3 do
@@ -359,6 +379,10 @@ if Code.ensure_loaded?(Mariaex.Connection) do
     defp expr({:date_add, _, [date, count, interval]}, sources, query) do
       "CAST(date_add(" <> expr(date, sources, query) <> ", "
                        <> interval(count, interval, sources, query) <> ") AS date)"
+    end
+
+    defp expr({:ilike, _, [_, _]}, _sources, query) do
+      error!(query, "ilike is not supported by MySQL")
     end
 
     defp expr({fun, _, args}, sources, query) when is_atom(fun) and is_list(args) do
@@ -400,7 +424,7 @@ if Code.ensure_loaded?(Mariaex.Connection) do
     end
 
     defp expr(%Ecto.Query.Tagged{value: other, type: type}, sources, query) do
-      "CAST(#{expr(other, sources, query)} AS " <> ecto_to_db(type, query) <> ")"
+      "CAST(#{expr(other, sources, query)} AS " <> ecto_cast_to_db(type, query) <> ")"
     end
 
     defp expr(nil, _sources, _query),   do: "NULL"
@@ -444,11 +468,13 @@ if Code.ensure_loaded?(Mariaex.Connection) do
     defp create_names(prefix, sources, pos, limit) when pos < limit do
       current =
         case elem(sources, pos) do
-          {table, model} ->
+          {table, schema} ->
             name = String.first(table) <> Integer.to_string(pos)
-            {quote_table(prefix, table), name, model}
+            {quote_table(prefix, table), name, schema}
           {:fragment, _, _} ->
             {nil, "f" <> Integer.to_string(pos), nil}
+          %Ecto.SubQuery{} ->
+            {nil, "s" <> Integer.to_string(pos), nil}
         end
       [current|create_names(prefix, sources, pos + 1, limit)]
     end
@@ -459,17 +485,28 @@ if Code.ensure_loaded?(Mariaex.Connection) do
 
     ## DDL
 
-    alias Ecto.Migration.Table
-    alias Ecto.Migration.Index
-    alias Ecto.Migration.Reference
+    alias Ecto.Migration.{Table, Index, Reference, Constraint}
+
+    defp wrap_in_parentheses(""), do: ""
+    defp wrap_in_parentheses(str), do: "(#{str})"
 
     def execute_ddl({command, %Table{} = table, columns}) when command in [:create, :create_if_not_exists] do
       engine  = engine_expr(table.engine)
       options = options_expr(table.options)
-      if_not_exists = if command == :create_if_not_exists, do: " IF NOT EXISTS", else: ""
+      if_not_exists = if command == :create_if_not_exists, do: "IF NOT EXISTS", else: ""
 
-      "CREATE TABLE" <> if_not_exists <>
-        " #{quote_table(table.prefix, table.name)} (#{column_definitions(table, columns)})" <> engine <> options
+      table_structure = [column_definitions(table, columns), pk_definition(columns)]
+      |> assemble(", ")
+      |> wrap_in_parentheses
+
+      assemble([
+        "CREATE TABLE",
+        if_not_exists,
+        quote_table(table.prefix, table.name),
+        table_structure,
+        engine,
+        options
+      ])
     end
 
     def execute_ddl({command, %Table{} = table}) when command in [:drop, :drop_if_exists] do
@@ -479,12 +516,21 @@ if Code.ensure_loaded?(Mariaex.Connection) do
     end
 
     def execute_ddl({:alter, %Table{}=table, changes}) do
-      "ALTER TABLE #{quote_table(table.prefix, table.name)} #{column_changes(table, changes)}"
+      pk_definition = case pk_definition(changes) do
+        "" -> ""
+        pk -> ", ADD #{pk}"
+      end
+      "ALTER TABLE #{quote_table(table.prefix, table.name)} #{column_changes(table, changes)}" <>
+      "#{pk_definition}"
     end
 
     def execute_ddl({:create, %Index{}=index}) do
       create = "CREATE#{if index.unique, do: " UNIQUE"} INDEX"
       using  = if index.using, do: "USING #{index.using}", else: []
+
+      if index.where do
+        error!(nil, "MySQL adapter does not support where in indexes")
+      end
 
       assemble([create,
                 quote_name(index.name),
@@ -498,12 +544,20 @@ if Code.ensure_loaded?(Mariaex.Connection) do
     def execute_ddl({:create_if_not_exists, %Index{}}),
       do: error!(nil, "MySQL adapter does not support create if not exists for index")
 
+    def execute_ddl({:create, %Constraint{check: check}}) when is_binary(check),
+      do: error!(nil, "MySQL adapter does not support check constraints")
+    def execute_ddl({:create, %Constraint{exclude: exclude}}) when is_binary(exclude),
+      do: error!(nil, "MySQL adapter does not support exclusion constraints")
+
     def execute_ddl({:drop, %Index{}=index}) do
       assemble(["DROP INDEX",
                 quote_name(index.name),
                 "ON #{quote_table(index.prefix, index.table)}",
                 if_do(index.concurrently, "LOCK=NONE")])
     end
+
+    def execute_ddl({:drop, %Constraint{}}),
+      do: error!(nil, "MySQL adapter does not support constraints")
 
     def execute_ddl({:drop_if_exists, %Index{}}),
       do: error!(nil, "MySQL adapter does not support drop if exists for index")
@@ -512,13 +566,8 @@ if Code.ensure_loaded?(Mariaex.Connection) do
       "RENAME TABLE #{quote_table(current_table.prefix, current_table.name)} TO #{quote_table(new_table.prefix, new_table.name)}"
     end
 
-    def execute_ddl({:rename, %Table{}=table, current_column, new_column}) do
-      [
-        "SELECT @column_type := COLUMN_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = '#{table.name}' AND COLUMN_NAME = '#{current_column}' LIMIT 1",
-        "SET @rename_stmt = concat('ALTER TABLE #{quote_table(table.prefix, table.name)} CHANGE COLUMN `#{current_column}` `#{new_column}` ', @column_type)",
-        "PREPARE rename_stmt FROM @rename_stmt",
-        "EXECUTE rename_stmt"
-      ]
+    def execute_ddl({:rename, _table, _current_column, _new_column}) do
+      error!(nil, "MySQL adapter does not support renaming columns")
     end
 
     def execute_ddl(string) when is_binary(string), do: string
@@ -526,17 +575,29 @@ if Code.ensure_loaded?(Mariaex.Connection) do
     def execute_ddl(keyword) when is_list(keyword),
       do: error!(nil, "MySQL adapter does not support keyword lists in execute")
 
+    defp pk_definition(columns) do
+      pks =
+        for {_, name, _, opts} <- columns,
+            opts[:primary_key],
+            do: name
+
+      case pks do
+        [] -> ""
+        _  -> "PRIMARY KEY (" <> Enum.map_join(pks, ", ", &quote_name/1) <> ")"
+      end
+    end
+
     defp column_definitions(table, columns) do
       Enum.map_join(columns, ", ", &column_definition(table, &1))
     end
 
     defp column_definition(table, {:add, name, %Reference{} = ref, opts}) do
       assemble([quote_name(name), reference_column_type(ref.type, opts),
-                column_options(name, opts), reference_expr(ref, table, name)])
+                column_options(opts), reference_expr(ref, table, name)])
     end
 
     defp column_definition(_table, {:add, name, type, opts}) do
-      assemble([quote_name(name), column_type(type, opts), column_options(name, opts)])
+      assemble([quote_name(name), column_type(type, opts), column_options(opts)])
     end
 
     defp column_changes(table, columns) do
@@ -545,36 +606,31 @@ if Code.ensure_loaded?(Mariaex.Connection) do
 
     defp column_change(table, {:add, name, %Reference{} = ref, opts}) do
       assemble(["ADD", quote_name(name), reference_column_type(ref.type, opts),
-                column_options(name, opts), constraint_expr(ref, table, name)])
+                column_options(opts), constraint_expr(ref, table, name)])
     end
 
     defp column_change(_table, {:add, name, type, opts}) do
-      assemble(["ADD", quote_name(name), column_type(type, opts), column_options(name, opts)])
+      assemble(["ADD", quote_name(name), column_type(type, opts), column_options(opts)])
     end
 
     defp column_change(table, {:modify, name, %Reference{} = ref, opts}) do
       assemble([
         "MODIFY", quote_name(name), reference_column_type(ref.type, opts),
-        column_options(name, opts), constraint_expr(ref, table, name)
+        column_options(opts), constraint_expr(ref, table, name)
       ])
     end
 
     defp column_change(_table, {:modify, name, type, opts}) do
-      assemble(["MODIFY", quote_name(name), column_type(type, opts), column_options(name, opts)])
+      assemble(["MODIFY", quote_name(name), column_type(type, opts), column_options(opts)])
     end
 
     defp column_change(_table, {:remove, name}), do: "DROP #{quote_name(name)}"
 
-    defp column_options(name, opts) do
+    defp column_options(opts) do
       default = Keyword.fetch(opts, :default)
       null    = Keyword.get(opts, :null)
-      pk      = Keyword.get(opts, :primary_key)
-
-      [default_expr(default), null_expr(null), pk_expr(pk, name)]
+      [default_expr(default), null_expr(null)]
     end
-
-    defp pk_expr(true, name), do: ", PRIMARY KEY(#{quote_name(name)})"
-    defp pk_expr(_, _), do: []
 
     defp null_expr(false), do: "NOT NULL"
     defp null_expr(true), do: "NULL"
@@ -593,17 +649,16 @@ if Code.ensure_loaded?(Mariaex.Connection) do
 
     defp index_expr(literal), do: quote_name(literal)
 
-    defp engine_expr(nil),
-      do: " ENGINE = INNODB"
+    defp engine_expr(nil), do: engine_expr("INNODB")
     defp engine_expr(storage_engine),
-      do: String.upcase(" ENGINE = #{storage_engine}")
+      do: String.upcase("ENGINE = #{storage_engine}")
 
     defp options_expr(nil),
       do: ""
     defp options_expr(keyword) when is_list(keyword),
       do: error!(nil, "MySQL adapter does not support keyword lists in :options")
     defp options_expr(options),
-      do: " #{options}"
+      do: "#{options}"
 
     defp column_type(type, opts) do
       size      = Keyword.get(opts, :size)
@@ -623,13 +678,13 @@ if Code.ensure_loaded?(Mariaex.Connection) do
       do: ", ADD CONSTRAINT #{reference_name(ref, table, name)} " <>
           "FOREIGN KEY (#{quote_name(name)}) " <>
           "REFERENCES #{quote_table(table.prefix, ref.table)}(#{quote_name(ref.column)})" <>
-          reference_on_delete(ref.on_delete)
+          reference_on_delete(ref.on_delete) <> reference_on_update(ref.on_update)
 
     defp reference_expr(%Reference{} = ref, table, name),
       do: ", CONSTRAINT #{reference_name(ref, table, name)} FOREIGN KEY " <>
           "(#{quote_name(name)}) REFERENCES " <>
           "#{quote_table(table.prefix, ref.table)}(#{quote_name(ref.column)})" <>
-          reference_on_delete(ref.on_delete)
+          reference_on_delete(ref.on_delete) <> reference_on_update(ref.on_update)
 
     defp reference_name(%Reference{name: nil}, table, column),
       do: quote_name("#{table.name}_#{column}_fkey")
@@ -643,7 +698,16 @@ if Code.ensure_loaded?(Mariaex.Connection) do
     defp reference_on_delete(:delete_all), do: " ON DELETE CASCADE"
     defp reference_on_delete(_), do: ""
 
+    defp reference_on_update(:nilify_all), do: " ON UPDATE SET NULL"
+    defp reference_on_update(:update_all), do: " ON UPDATE CASCADE"
+    defp reference_on_update(_), do: ""
+
     ## Helpers
+
+    defp get_source(query, sources, ix, source) do
+      {expr, name, _schema} = elem(sources, ix)
+      {expr || "(" <> expr(source, sources, query) <> ")", name}
+    end
 
     defp quote_name(name)
     defp quote_name(name) when is_atom(name),
@@ -659,7 +723,6 @@ if Code.ensure_loaded?(Mariaex.Connection) do
     defp quote_table(nil, name),    do: quote_table(name)
     defp quote_table(prefix, name), do: quote_table(prefix) <> "." <> quote_table(name)
 
-
     defp quote_table(name) when is_atom(name),
       do: quote_table(Atom.to_string(name))
     defp quote_table(name) do
@@ -669,10 +732,12 @@ if Code.ensure_loaded?(Mariaex.Connection) do
       <<?`, name::binary, ?`>>
     end
 
-    defp assemble(list) do
+    defp assemble(list), do: assemble(list, " ")
+    defp assemble(list, joiner) do
       list
       |> List.flatten
-      |> Enum.join(" ")
+      |> Enum.reject(fn(v)-> v == "" end)
+      |> Enum.join(joiner)
     end
 
     defp if_do(condition, value) do
@@ -685,6 +750,9 @@ if Code.ensure_loaded?(Mariaex.Connection) do
       |> :binary.replace("\\", "\\\\", [:global])
     end
 
+    defp ecto_cast_to_db(:string, _query), do: "char"
+    defp ecto_cast_to_db(type, query), do: ecto_to_db(type, query)
+
     defp ecto_to_db(type, query \\ nil)
     defp ecto_to_db({:array, _}, query),
       do: error!(query, "Array type is not supported by MySQL")
@@ -695,6 +763,7 @@ if Code.ensure_loaded?(Mariaex.Connection) do
     defp ecto_to_db(:binary, _query),    do: "blob"
     defp ecto_to_db(:uuid, _query),      do: "binary(16)" # MySQL does not support uuid
     defp ecto_to_db(:map, _query),       do: "text"
+    defp ecto_to_db({:map, _}, _query),  do: "text"
     defp ecto_to_db(other, _query),      do: Atom.to_string(other)
 
     defp error!(nil, message) do

@@ -2,14 +2,19 @@ defmodule Mix.Tasks.Ecto.Migrate do
   use Mix.Task
   import Mix.Ecto
 
-  @shortdoc "Run migrations up on a repo"
+  @shortdoc "Runs the repository migrations"
+  @recursive true
 
   @moduledoc """
   Runs the pending migrations for the given repository.
 
+  The repository must be set under `:ecto_repos` in the
+  current app configuration or given via the `-r` option.
+
   By default, migrations are expected at "priv/YOUR_REPO/migrations"
   directory of the current application but it can be configured
-  by specify the `:priv` key under the repository configuration.
+  to be any subdirectory of `priv` by specifying the `:priv` key
+  under the repository configuration.
 
   Runs all pending migrations by default. To migrate up
   to a version number, supply `--to version_number`.
@@ -32,11 +37,13 @@ defmodule Mix.Tasks.Ecto.Migrate do
 
   ## Command line options
 
-    * `-r`, `--repo` - the repo to migrate (defaults to `YourApp.Repo`)
+    * `-r`, `--repo` - the repo to migrate
     * `--all` - run all pending migrations
     * `--step` / `-n` - run n number of pending migrations
     * `--to` / `-v` - run all migrations up to and including version
     * `--quiet` - do not log migration commands
+    * `--prefix` - the prefix to run migrations on
+    * `--pool-size` - the pool size if the repository is started only for the task (defaults to 1)
 
   """
 
@@ -45,23 +52,42 @@ defmodule Mix.Tasks.Ecto.Migrate do
     repos = parse_repo(args)
 
     {opts, _, _} = OptionParser.parse args,
-      switches: [all: :boolean, step: :integer, to: :integer, quiet: :boolean],
+      switches: [all: :boolean, step: :integer, to: :integer, quiet: :boolean,
+                 prefix: :string, pool_size: :integer],
       aliases: [n: :step, v: :to]
 
-    unless opts[:to] || opts[:step] || opts[:all] do
-      opts = Keyword.put(opts, :all, true)
-    end
+    opts =
+      if opts[:to] || opts[:step] || opts[:all],
+        do: opts,
+        else: Keyword.put(opts, :all, true)
 
-    if opts[:quiet] do
-      opts = Keyword.put(opts, :log, false)
-    end
+    opts =
+      if opts[:quiet],
+        do: Keyword.put(opts, :log, false),
+        else: opts
 
     Enum.each repos, fn repo ->
       ensure_repo(repo, args)
-      {:ok, pid} = ensure_started(repo)
+      ensure_migrations_path(repo)
+      {:ok, pid, apps} = ensure_started(repo, opts)
+      sandbox? = repo.config[:pool] == Ecto.Adapters.SQL.Sandbox
 
-      migrator.(repo, migrations_path(repo), :up, opts)
-      pid && ensure_stopped(repo, pid)
+      # If the pool is Ecto.Adapters.SQL.Sandbox,
+      # let's make sure we get a connection outside of a sandbox.
+      if sandbox? do
+        Ecto.Adapters.SQL.Sandbox.checkin(repo)
+        Ecto.Adapters.SQL.Sandbox.checkout(repo, sandbox: false)
+      end
+
+      migrated =
+        try do
+          migrator.(repo, migrations_path(repo), :up, opts)
+        after
+          sandbox? && Ecto.Adapters.SQL.Sandbox.checkin(repo)
+        end
+
+      pid && repo.stop(pid)
+      restart_apps_if_migrated(apps, migrated)
     end
   end
 end

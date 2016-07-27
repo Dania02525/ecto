@@ -1,12 +1,14 @@
 # Ecto
 
-[![Build Status](https://travis-ci.org/elixir-lang/ecto.svg?branch=master)](https://travis-ci.org/elixir-lang/ecto)
-[![Inline docs](http://inch-ci.org/github/elixir-lang/ecto.svg?branch=master&style=flat)](http://inch-ci.org/github/elixir-lang/ecto)
+[![Build Status](https://travis-ci.org/elixir-ecto/ecto.svg?branch=master)](https://travis-ci.org/elixir-ecto/ecto)
+[![Inline docs](http://inch-ci.org/github/elixir-ecto/ecto.svg?branch=master&style=flat)](http://inch-ci.org/github/elixir-ecto/ecto)
 
 Ecto is a domain specific language for writing queries and interacting with databases in Elixir. Here is an example:
 
 ```elixir
 # In your config/config.exs file
+config :my_app, ecto_repos: [Sample.Repo]
+
 config :my_app, Sample.Repo,
   adapter: Ecto.Adapters.Postgres,
   database: "ecto_simple",
@@ -20,7 +22,7 @@ defmodule Sample.Repo do
 end
 
 defmodule Sample.Weather do
-  use Ecto.Model
+  use Ecto.Schema
 
   schema "weather" do
     field :city     # Defaults to type :string
@@ -35,28 +37,36 @@ defmodule Sample.App do
   alias Sample.Weather
   alias Sample.Repo
 
-  def sample_query do
+  def keyword_query do
     query = from w in Weather,
-          where: w.prcp > 0 or is_nil(w.prcp),
+         where: w.prcp > 0 or is_nil(w.prcp),
          select: w
     Repo.all(query)
+  end
+
+  def pipe_query do
+    Weather
+    |> where(city: "Kraków")
+    |> order_by(:temp_lo)
+    |> limit(10)
+    |> Repo.all
   end
 end
 ```
 
-See the [online documentation](http://hexdocs.pm/ecto) or [run the sample application](https://github.com/elixir-lang/ecto/tree/master/examples/simple) for more information.
+See the [online documentation](http://hexdocs.pm/ecto) or [run the sample application](https://github.com/elixir-ecto/ecto/tree/master/examples/simple) for more information.
 
 ## Usage
 
 You need to add both Ecto and the database adapter as a dependency to your `mix.exs` file. The supported databases and their adapters are:
 
-Database                | Ecto Adapter           | Dependency
-:---------------------- | :--------------------- | :-------------------
-PostgreSQL              | Ecto.Adapters.Postgres | [postgrex][postgrex]
-MySQL                   | Ecto.Adapters.MySQL    | [mariaex][mariaex]
-MSSQL                   | Tds.Ecto               | [tds_ecto][tds_ecto]
-SQLite3                 | Sqlite.Ecto            | [sqlite_ecto][sqlite_ecto]
-MongoDB                 | Mongo.Ecto             | [mongodb_ecto][mongodb_ecto]
+Database   | Ecto Adapter           | Dependency                   | Ecto 2.0 compatible?
+:----------| :--------------------- | :----------------------------| :-------------------
+PostgreSQL | Ecto.Adapters.Postgres | [postgrex][postgrex]         | Yes
+MySQL      | Ecto.Adapters.MySQL    | [mariaex][mariaex]           | Yes
+MSSQL      | Tds.Ecto               | [tds_ecto][tds_ecto]         | No
+SQLite3    | Sqlite.Ecto            | [sqlite_ecto][sqlite_ecto]   | No
+MongoDB    | Mongo.Ecto             | [mongodb_ecto][mongodb_ecto] | No
 
 [postgrex]: http://github.com/ericmj/postgrex
 [mariaex]: http://github.com/xerions/mariaex
@@ -69,7 +79,7 @@ For example, if you want to use PostgreSQL, add to your `mix.exs` file:
 ```elixir
 defp deps do
   [{:postgrex, ">= 0.0.0"},
-   {:ecto, "~> 1.0"}]
+   {:ecto, "~> 2.0.0"}]
 end
 ```
 
@@ -97,18 +107,23 @@ We are currently looking for contributions to add support for other SQL database
 
   * [Documentation](http://hexdocs.pm/ecto)
   * [Mailing list](https://groups.google.com/forum/#!forum/elixir-ecto)
-  * [Examples](https://github.com/elixir-lang/ecto/tree/master/examples)
+  * [Examples](https://github.com/elixir-ecto/ecto/tree/master/examples)
 
 ## Contributing
 
-For overall guidelines, please see [CONTRIBUTING.md](CONTRIBUTING.md).
+Contributions are welcome! In particular, remember to:
+
+* Do not use the issues tracker for help or support requests (try Stack Overflow, IRC or mailing lists, etc).
+* For proposing a new feature, please start a discussion on [elixir-ecto](https://groups.google.com/forum/#!forum/elixir-ecto).
+* For bugs, do a quick search in the issues tracker and make sure the bug has not yet been reported.
+* Finally, be nice and have fun! Remember all interactions in this project follow the same [Code of Conduct as Elixir](https://github.com/elixir-lang/elixir/blob/master/CODE_OF_CONDUCT.md).
 
 ### Running tests
 
 Clone the repo and fetch its dependencies:
 
 ```
-$ git clone https://github.com/elixir-lang/ecto.git
+$ git clone https://github.com/elixir-ecto/ecto.git
 $ cd ecto
 $ mix deps.get
 $ mix test
@@ -120,7 +135,7 @@ Besides the unit tests above, it is recommended to run the adapter integration t
 # Run only PostgreSQL tests (version of PostgreSQL must be >= 9.4 to support jsonb)
 MIX_ENV=pg mix test
 
-# Run all tests (unit and all adapters/pools)
+# Run all tests (unit and all adapters)
 mix test.all
 ```
 

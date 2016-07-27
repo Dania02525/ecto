@@ -13,53 +13,32 @@ defmodule Ecto.QueryTest do
     end
   end
 
-  test "where allows macros" do
+  ## General
+
+  test "allows macros" do
     test_data = "test"
     query = from(p in "posts") |> where([q], macro_equal(q.title, ^test_data))
     assert "&0.title() == ^0" == Macro.to_string(hd(query.wheres).expr)
   end
 
-  test "vars are order on_delete" do
-    from(p in "posts", []) |> select([q], q.title)
-  end
-
-  test "can append to selected query" do
-    from(p in "posts", []) |> select([], 1) |> where([], true)
-  end
-
-  test "binding should be list of variables" do
-    assert_raise Ecto.Query.CompileError,
-                 "binding list should contain only variables, got: 0", fn ->
-      quote_and_eval select(%Query{}, [0], 1)
-    end
-  end
-
-  test "does not allow nils in comparison" do
+  test "where does not allow nils in comparison" do
     assert_raise Ecto.Query.CompileError,
                  ~r"comparison with nil is forbidden as it always evaluates to false", fn ->
       quote_and_eval from p in "posts", where: p.id == nil
     end
   end
 
-  test "cannot bind non-Queryable in from" do
+  test "from does not allow non-queryable" do
     assert_raise Protocol.UndefinedError, fn ->
       from(p in 123, []) |> select([p], p.title)
     end
 
     assert_raise UndefinedFunctionError, fn ->
-      from(p in NotAModel, []) |> select([p], p.title)
+      from(p in NotASchema, []) |> select([p], p.title)
     end
   end
 
-  test "string source query" do
-    assert %Query{from: {"posts", nil}} = from(p in "posts", []) |> select([p], p.title)
-  end
-
-  test "string source and atom query" do
-    assert %Query{from: {"user_posts", Post}} = from(p in {"user_posts", Post}, []) |> select([p], p.title)
-  end
-
-  test "normalize from expression" do
+  test "from normalizes expressions" do
     quote_and_eval(from("posts", []))
 
     assert_raise ArgumentError, fn ->
@@ -71,7 +50,37 @@ defmodule Ecto.QueryTest do
     end
   end
 
-  test "unbound _ var" do
+  ## subqueries
+
+  test "supports subqueries" do
+    assert subquery("posts").query.from == {"posts", nil}
+    assert subquery(subquery("posts")).query.from == {"posts", nil}
+    assert subquery(subquery("posts").query).query.from == {"posts", nil}
+  end
+
+  ## bindings
+
+  test "macros do not require binding" do
+    _ = from(p in "posts") |> limit(1)
+    _ = from(p in "posts") |> order_by([asc: :title])
+    _ = from(p in "posts") |> where(title: "foo")
+    _ = from(p in "posts") |> having(title: "foo")
+    _ = from(p in "posts") |> offset(1)
+    _ = from(p in "posts") |> update(set: [title: "foo"])
+    _ = from(p in "posts") |> select([:title])
+    _ = from(p in "posts") |> group_by([:title])
+    _ = from(p in "posts") |> distinct(true)
+    _ = from(p in "posts") |> join(:inner, "comments")
+  end
+
+  test "binding should be list of variables" do
+    assert_raise Ecto.Query.CompileError,
+                 "binding list should contain only variables, got: 0", fn ->
+      quote_and_eval select(%Query{}, [0], 1)
+    end
+  end
+
+  test "supports unbound _ var" do
     assert_raise Ecto.Query.CompileError, fn ->
       quote_and_eval("posts" |> select([], _.x))
     end
@@ -82,7 +91,7 @@ defmodule Ecto.QueryTest do
     "posts" |> join(:inner, [], "comments") |> select([_, _], 0)
   end
 
-  test "binding collision" do
+  test "raises on binding collision" do
     assert_raise Ecto.Query.CompileError, "variable `x` is bound twice", fn ->
       quote_and_eval("posts" |> from("comments") |> select([x, x], x.id))
     end
@@ -98,11 +107,22 @@ defmodule Ecto.QueryTest do
     end
   end
 
-  test "keyword query" do
+  test "joins adds bindings" do
+    from(c in "comments", join: p in "posts", select: {p.title, c.text})
+    "comments" |> join(:inner, [c], p in "posts", true) |> select([c,p], {p.title, c.text})
+  end
+
+  test "joins adds binds with custom values" do
+    base = join("comments", :inner, [c], p in "posts", true)
+    assert select(base, [p: 1], p) == select(base, [c, p], p)
+  end
+
+  ## keyword queries
+
+  test "supports keyword query" do
     # queries need to be on the same line or == wont work
     assert from(p in "posts", select: 1<2) == from(p in "posts", []) |> select([p], 1<2)
     assert from(p in "posts", where: 1<2)  == from(p in "posts", []) |> where([p], 1<2)
-    assert from(p in {"posts", Post}, where: 1<2)  == from(p in {"posts", Post}, []) |> where([p], 1<2)
 
     query = "posts"
     assert (query |> select([p], p.title)) == from(p in query, select: p.title)
@@ -138,7 +158,7 @@ defmodule Ecto.QueryTest do
     assert List.keyfind(list, :__struct__, 0) == {:__struct__, Query}
   end
 
-  test "join on keyword query" do
+  test "keyword query supports joins" do
     from(c in "comments", join: p in "posts", on: c.text == "", select: c)
     from(c in "comments", join: p in {"user_posts", Post}, on: c.text == "", select: c)
     from(p in "posts", join: c in assoc(p, :comments), select: p)
@@ -147,22 +167,9 @@ defmodule Ecto.QueryTest do
     assert_raise Ecto.Query.CompileError, message, fn ->
       quote_and_eval(from(c in "comments", on: c.text == "", select: c))
     end
-
-    message = ~r"cannot specify `on` on `inner_join` when using association join,"
-    assert_raise Ecto.Query.CompileError, message, fn ->
-      quote_and_eval(from(c in "comments", join: p in assoc(c, :post), on: true))
-    end
   end
 
-  test "join queries adds binds" do
-    from(c in "comments", join: p in "posts", select: {p.title, c.text})
-    "comments" |> join(:inner, [c], p in "posts", true) |> select([c,p], {p.title, c.text})
-  end
-
-  test "join queries adds binds with custom values" do
-    base = join("comments", :inner, [c], p in "posts", true)
-    assert select(base, [p: 1], p) == select(base, [c, p], p)
-  end
+  ## exclude
 
   test "exclude/2 will exclude a passed in field" do
     base = %Ecto.Query{}
@@ -253,5 +260,14 @@ defmodule Ecto.QueryTest do
 
     assert excluded_query.preloads == base.preloads
     assert excluded_query.assocs == base.assocs
+  end
+
+  ## fragments
+
+  test "fragment/1 raises at runtime when interpolation is not a keyword list" do
+    assert_raise ArgumentError, ~r/only a keyword list.*1 = \?/, fn ->
+      clause = "1 = ?"
+      from p in "posts", where: fragment(^clause)
+    end
   end
 end

@@ -29,15 +29,27 @@ defmodule Ecto.Repo do
   all adapters, they are:
 
     * `:priv` - the directory where to keep repository data, like
-      migrations, schema and more. Defaults to "priv/YOUR_REPO"
+      migrations, schema and more. Defaults to "priv/YOUR_REPO".
+      It must always point to a subdirectory inside the priv directory.
 
     * `:url` - an URL that specifies storage information. Read below
       for more information
 
+    * `:loggers` - a list of `{mod, fun, args}` tuples that are
+      invoked by adapters for logging queries and other events.
+      The given module and function will be called with a log
+      entry (see `Ecto.LogEntry`) and the given arguments. The
+      invoked function must return the `Ecto.LogEntry` as result.
+      The default value is: `[{Ecto.LogEntry, :log, []}]`, which
+      will call `Ecto.LogEntry.log/1` that will use Elixir's `Logger`
+      in `:debug` mode. You may pass any desired mod-fun-args
+      triplet or `[{Ecto.LogEntry, :log, [:info]}]` if you want to
+      keep the current behaviour but use another log level.
+
   ## URLs
 
   Repositories by default support URLs. For example, the configuration
-  above could be rewriten to:
+  above could be rewritten to:
 
       config :my_app, Repo,
         url: "ecto://postgres:postgres@localhost/ecto_simple"
@@ -51,9 +63,20 @@ defmodule Ecto.Repo do
       config :my_app, Repo,
         url: {:system, "DATABASE_URL"}
 
+  ## Shared options
+
+  Almost all of the repository operations below accept the following
+  options:
+
+    * `:timeout` - The time in milliseconds to wait for the query call to
+      finish, `:infinity` will wait indefinitely (default: 15000);
+    * `:pool_timeout` - The time in milliseconds to wait for calls to the pool
+      to finish, `:infinity` will wait indefinitely (default: 5000);
+    * `:log` - When false, does not log the query
+
+  Such cases will be explicitly documented as well as any extra option.
   """
 
-  use Behaviour
   @type t :: module
 
   @doc false
@@ -61,16 +84,27 @@ defmodule Ecto.Repo do
     quote bind_quoted: [opts: opts] do
       @behaviour Ecto.Repo
 
-      {otp_app, adapter, pool, config} = Ecto.Repo.Supervisor.parse_config(__MODULE__, opts)
+      {otp_app, adapter, config} = Ecto.Repo.Supervisor.parse_config(__MODULE__, opts)
       @otp_app otp_app
       @adapter adapter
       @config  config
-      @pool pool
-      @query_cache config[:query_cache] || __MODULE__
       @before_compile adapter
 
-      require Logger
-      @log_level config[:log_level] || :debug
+      loggers =
+        Enum.reduce(config[:loggers] || [Ecto.LogEntry], quote(do: entry), fn
+          mod, acc when is_atom(mod) ->
+            quote do: unquote(mod).log(unquote(acc))
+          {mod, fun, args}, acc ->
+            quote do: unquote(mod).unquote(fun)(unquote(acc), unquote_splicing(args))
+        end)
+
+      def __adapter__ do
+        @adapter
+      end
+
+      def __log__(entry) do
+        unquote(loggers)
+      end
 
       def config do
         Ecto.Repo.Supervisor.config(__MODULE__, @otp_app, [])
@@ -81,11 +115,15 @@ defmodule Ecto.Repo do
       end
 
       def stop(pid, timeout \\ 5000) do
-        @adapter.stop(__MODULE__, pid, timeout)
+        Supervisor.stop(pid, :normal, timeout)
       end
 
-      def transaction(opts \\ [], fun) when is_list(opts) do
-        @adapter.transaction(__MODULE__, opts, fun)
+      def transaction(fun_or_multi, opts \\ []) do
+        Ecto.Repo.Queryable.transaction(@adapter, __MODULE__, fun_or_multi, opts)
+      end
+
+      def in_transaction? do
+        @adapter.in_transaction?(__MODULE__)
       end
 
       def rollback(value) do
@@ -105,11 +143,11 @@ defmodule Ecto.Repo do
       end
 
       def get_by(queryable, clauses, opts \\ []) do
-        Ecto.Repo.Queryable.get_by(__MODULE__, unquote(adapter), queryable, clauses, opts)
+        Ecto.Repo.Queryable.get_by(__MODULE__, @adapter, queryable, clauses, opts)
       end
 
       def get_by!(queryable, clauses, opts \\ []) do
-        Ecto.Repo.Queryable.get_by!(__MODULE__, unquote(adapter), queryable, clauses, opts)
+        Ecto.Repo.Queryable.get_by!(__MODULE__, @adapter, queryable, clauses, opts)
       end
 
       def one(queryable, opts \\ []) do
@@ -120,6 +158,15 @@ defmodule Ecto.Repo do
         Ecto.Repo.Queryable.one!(__MODULE__, @adapter, queryable, opts)
       end
 
+      def aggregate(queryable, aggregate, field, opts \\ [])
+          when aggregate in [:count, :avg, :max, :min, :sum] and is_atom(field) do
+        Ecto.Repo.Queryable.aggregate(__MODULE__, @adapter, queryable, aggregate, field, opts)
+      end
+
+      def insert_all(schema_or_source, entries, opts \\ []) do
+        Ecto.Repo.Schema.insert_all(__MODULE__, @adapter, schema_or_source, entries, opts)
+      end
+
       def update_all(queryable, updates, opts \\ []) do
         Ecto.Repo.Queryable.update_all(__MODULE__, @adapter, queryable, updates, opts)
       end
@@ -128,138 +175,113 @@ defmodule Ecto.Repo do
         Ecto.Repo.Queryable.delete_all(__MODULE__, @adapter, queryable, opts)
       end
 
-      def insert(model, opts \\ []) do
-        Ecto.Repo.Model.insert(__MODULE__, @adapter, model, opts)
+      def insert(struct, opts \\ []) do
+        Ecto.Repo.Schema.insert(__MODULE__, @adapter, struct, opts)
       end
 
-      def update(model, opts \\ []) do
-        Ecto.Repo.Model.update(__MODULE__, @adapter, model, opts)
+      def update(struct, opts \\ []) do
+        Ecto.Repo.Schema.update(__MODULE__, @adapter, struct, opts)
       end
 
-      def delete(model, opts \\ []) do
-        Ecto.Repo.Model.delete(__MODULE__, @adapter, model, opts)
+      def insert_or_update(changeset, opts \\ []) do
+        Ecto.Repo.Schema.insert_or_update(__MODULE__, @adapter, changeset, opts)
       end
 
-      def insert!(model, opts \\ []) do
-        Ecto.Repo.Model.insert!(__MODULE__, @adapter, model, opts)
+      def delete(struct, opts \\ []) do
+        Ecto.Repo.Schema.delete(__MODULE__, @adapter, struct, opts)
       end
 
-      def update!(model, opts \\ []) do
-        Ecto.Repo.Model.update!(__MODULE__, @adapter, model, opts)
+      def insert!(struct, opts \\ []) do
+        Ecto.Repo.Schema.insert!(__MODULE__, @adapter, struct, opts)
       end
 
-      def delete!(model, opts \\ []) do
-        Ecto.Repo.Model.delete!(__MODULE__, @adapter, model, opts)
+      def update!(struct, opts \\ []) do
+        Ecto.Repo.Schema.update!(__MODULE__, @adapter, struct, opts)
       end
 
-      def preload(model_or_models, preloads) do
-        Ecto.Repo.Preloader.preload(model_or_models, __MODULE__, preloads)
+      def insert_or_update!(changeset, opts \\ []) do
+        Ecto.Repo.Schema.insert_or_update!(__MODULE__, @adapter, changeset, opts)
       end
 
-      def __adapter__ do
-        @adapter
+      def delete!(struct, opts \\ []) do
+        Ecto.Repo.Schema.delete!(__MODULE__, @adapter, struct, opts)
       end
 
-      def __query_cache__ do
-        @query_cache
+      def preload(struct_or_structs, preloads, opts \\ []) do
+        Ecto.Repo.Preloader.preload(struct_or_structs, __MODULE__, preloads, opts)
       end
-
-      def __repo__ do
-        true
-      end
-
-      def __pool__ do
-        @pool
-      end
-
-      def log(entry) do
-        Logger.unquote(@log_level)(fn ->
-          {_entry, iodata} = Ecto.LogEntry.to_iodata(entry)
-          iodata
-        end, ecto_conn_pid: entry.connection_pid)
-      end
-
-      defoverridable [log: 1, __pool__: 0]
     end
   end
 
   @doc """
   Returns the adapter tied to the repository.
   """
-  defcallback __adapter__ :: Ecto.Adapter.t
+  @callback __adapter__ :: Ecto.Adapter.t
 
   @doc """
-  Simply returns true to mark this module as a repository.
-  """
-  defcallback __repo__ :: true
+  A callback invoked by adapters that logs the given action.
 
-  @doc """
-  Returns the pool information this repository should run under.
+  See `Ecto.LogEntry` for more information and `Ecto.Repo` module
+  documentation on setting up your own loggers.
   """
-  defcallback __pool__ :: {module, atom, timeout}
-
-  @doc """
-  Returns the name of the ETS table used for query caching.
-
-  The name can be configured with the `:query_cache` option.
-  """
-  defcallback __query_cache__ :: atom
+  @callback __log__(entry :: Ecto.LogEntry.t) :: Ecto.LogEntry.t
 
   @doc """
   Returns the adapter configuration stored in the `:otp_app` environment.
   """
-  defcallback config() :: Keyword.t
+  @callback config() :: Keyword.t
 
   @doc """
   Starts any connection pooling or supervision and return `{:ok, pid}`
-  or just `:ok` if nothing needs to be done.
+  or just `:ok` if nothing needs to be done. 
 
-  Returns `{:error, {:already_started, pid}}` if the repo already
+  Returns `{:error, {:already_started, pid}}` if the repo is already
   started or `{:error, term}` in case anything else goes wrong.
+
+  ## Options
+  See the configuration in the moduledoc for options shared between adapters,
+  for adapter-specific configuration see the adapter's documentation.
   """
-  defcallback start_link() :: {:ok, pid} |
-                              {:error, {:already_started, pid}} |
-                              {:error, term}
+  @callback start_link(opts :: Keyword.t) :: {:ok, pid} |
+                            {:error, {:already_started, pid}} |
+                            {:error, term}
 
   @doc """
   Shuts down the repository represented by the given pid.
-
-  This callback must be called by the process that called
-  `start_link/2`. Therefore, it is useful for scripts.
   """
-  defcallback stop(pid, timeout) :: :ok
+  @callback stop(pid, timeout) :: :ok
 
   @doc """
-  Fetches a single model from the data store where the primary key matches the
+  Fetches a single struct from the data store where the primary key matches the
   given id.
 
-  Returns `nil` if no result was found. If the model in the queryable
-  has no primary key `Ecto.NoPrimaryKeyFieldError` will be raised.
+  Returns `nil` if no result was found. If the struct in the queryable
+  has no or more than one primary key, it will raise an argument error.
 
   ## Options
 
-    * `:timeout` - The time in milliseconds to wait for the query call to
-      finish, `:infinity` will wait indefinitely (default: 15000);
-    * `:pool_timeout` - The time in milliseconds to wait for calls to the pool
-      to finish, `:infinity` will wait indefinitely (default: 5000);
-    * `:log` - When false, does not log the query
+  See the "Shared options" section at the module documentation.
+
+  ## Example
+
+      MyRepo.get(Post, 42)
 
   """
-  defcallback get(Ecto.Queryable.t, term, Keyword.t) :: Ecto.Model.t | nil | no_return
+  @callback get(queryable :: Ecto.Queryable.t, id :: term, opts :: Keyword.t) :: Ecto.Schema.t | nil | no_return
 
   @doc """
   Similar to `get/3` but raises `Ecto.NoResultsError` if no record was found.
 
   ## Options
 
-    * `:timeout` - The time in milliseconds to wait for the query call to
-      finish, `:infinity` will wait indefinitely (default: 15000);
-    * `:pool_timeout` - The time in milliseconds to wait for calls to the pool
-      to finish, `:infinity` will wait indefinitely (default: 5000);
-    * `:log` - When false, does not log the query
+  See the "Shared options" section at the module documentation.
+
+  ## Example
+
+      MyRepo.get!(Post, 42)
 
   """
-  defcallback get!(Ecto.Queryable.t, term, Keyword.t) :: Ecto.Model.t | nil | no_return
+  @callback get!(queryable :: Ecto.Queryable.t, id :: term, opts :: Keyword.t) :: Ecto.Schema.t | nil | no_return
 
   @doc """
   Fetches a single result from the query.
@@ -268,72 +290,103 @@ defmodule Ecto.Repo do
 
   ## Options
 
-    * `:timeout` - The time in milliseconds to wait for the query call to
-      finish, `:infinity` will wait indefinitely (default: 15000);
-    * `:pool_timeout` - The time in milliseconds to wait for calls to the pool
-      to finish, `:infinity` will wait indefinitely (default: 5000);
-    * `:log` - When false, does not log the query
+  See the "Shared options" section at the module documentation.
 
   ## Example
 
       MyRepo.get_by(Post, title: "My post")
 
   """
-  defcallback get_by(Ecto.Queryable.t, Keyword.t, Keyword.t) :: Ecto.Model.t | nil | no_return
+  @callback get_by(queryable :: Ecto.Queryable.t, clauses :: Keyword.t | map, opts :: Keyword.t) :: Ecto.Schema.t | nil | no_return
 
   @doc """
   Similar to `get_by/3` but raises `Ecto.NoResultsError` if no record was found.
 
   ## Options
 
-    * `:timeout` - The time in milliseconds to wait for the query call to
-      finish, `:infinity` will wait indefinitely (default: 15000);
-    * `:pool_timeout` - The time in milliseconds to wait for calls to the pool
-      to finish, `:infinity` will wait indefinitely (default: 5000);
-    * `:log` - When false, does not log the query
+  See the "Shared options" section at the module documentation.
 
   ## Example
 
       MyRepo.get_by!(Post, title: "My post")
 
   """
-  defcallback get_by!(Ecto.Queryable.t, Keyword.t, Keyword.t) :: Ecto.Model.t | nil | no_return
+  @callback get_by!(queryable :: Ecto.Queryable.t, clauses :: Keyword.t | map, opts :: Keyword.t) :: Ecto.Schema.t | nil | no_return
+
+  @doc """
+  Calculate the given `aggregate` over the given `field`.
+
+  If the query has a limit, offset or distinct set, it will be
+  automatically wrapped in a subquery in order to return the
+  proper result.
+
+  Any preload or select in the query will be ignored in favor of
+  the column being aggregated.
+
+  The aggregation will fail if any `group_by` field is set.
+
+  ## Options
+
+  See the "Shared options" section at the module documentation.
+
+  ## Examples
+
+      # Returns the number of visits per blog post
+      Repo.aggregate(Post, :avg, :visits)
+
+      # Returns the average number of visits for the top 10
+      query = from Post, limit: 10
+      Repo.aggregate(query, :avg, :visits)
+  """
+  @callback aggregate(queryable :: Ecto.Queryable.t, aggregate :: :avg | :count | :max | :min | :sum,
+                      field :: atom, opts :: Keyword.t) :: term | nil
 
   @doc """
   Fetches a single result from the query.
 
-  Returns `nil` if no result was found.
+  Returns `nil` if no result was found. Raises if more than one entry.
 
   ## Options
 
-    * `:timeout` - The time in milliseconds to wait for the call to finish,
-      `:infinity` will wait indefinitely (default: 5000);;
-    * `:log` - When false, does not log the query
-
+  See the "Shared options" section at the module documentation.
   """
-  defcallback one(Ecto.Queryable.t, Keyword.t) :: Ecto.Model.t | nil | no_return
+  @callback one(queryable :: Ecto.Queryable.t, opts :: Keyword.t) :: Ecto.Schema.t | nil | no_return
 
   @doc """
   Similar to `one/2` but raises `Ecto.NoResultsError` if no record was found.
 
+  Raises if more than one entry.
+
   ## Options
 
-    * `:timeout` - The time in milliseconds to wait for the call to finish,
-      `:infinity` will wait indefinitely (default: 5000);;
-    * `:log` - When false, does not log the query
-
+  See the "Shared options" section at the module documentation.
   """
-  defcallback one!(Ecto.Queryable.t, Keyword.t) :: Ecto.Model.t | nil | no_return
+  @callback one!(queryable :: Ecto.Queryable.t, opts :: Keyword.t) :: Ecto.Schema.t | no_return
 
   @doc """
-  Preloads all associations on the given model or models.
+  Preloads all associations on the given struct or structs.
 
   This is similar to `Ecto.Query.preload/3` except it allows
-  you to preload models after they have been fetched from the
+  you to preload structs after they have been fetched from the
   database.
 
   In case the association was already loaded, preload won't attempt
   to reload it.
+
+  ## Options
+
+  Besides the "Shared options" section at the module documentation,
+  it accepts:
+
+    * `:force` - By default, Ecto won't preload associations that
+      are already loaded. By setting this option to true, any existing
+      association will be discarded and reloaded.
+    * `:in_parallel` - If the preloads must be done in parallel. It can
+      only be performed when we have more than one preload and the
+      repository is not in a transaction. Defaults to `true`.
+    * `:prefix` - the prefix to fetch preloads from. By default, queries
+      will use the same prefix as the one in the given collection. This
+      option allows the prefix to be changed.
 
   ## Examples
 
@@ -342,8 +395,8 @@ defmodule Ecto.Repo do
       posts = Repo.preload posts, comments: from(c in Comment, order_by: c.published_at)
 
   """
-  defcallback preload([Ecto.Model.t] | Ecto.Model.t, preloads :: term) ::
-                      [Ecto.Model.t] | Ecto.Model.t
+  @callback preload(struct_or_structs, preloads :: term, opts :: Keyword.t) ::
+                    struct_or_structs when struct_or_structs: [Ecto.Schema.t] | Ecto.Schema.t
 
   @doc """
   Fetches all entries from the data store matching the given query.
@@ -352,11 +405,7 @@ defmodule Ecto.Repo do
 
   ## Options
 
-    * `:timeout` - The time in milliseconds to wait for the query call to
-      finish, `:infinity` will wait indefinitely (default: 15000);
-    * `:pool_timeout` - The time in milliseconds to wait for calls to the pool
-      to finish, `:infinity` will wait indefinitely (default: 5000);
-    * `:log` - When false, does not log the query
+  See the "Shared options" section at the module documentation.
 
   ## Example
 
@@ -365,7 +414,47 @@ defmodule Ecto.Repo do
            select: p.title
       MyRepo.all(query)
   """
-  defcallback all(Ecto.Query.t, Keyword.t) :: [Ecto.Model.t] | no_return
+  @callback all(queryable :: Ecto.Query.t, opts :: Keyword.t) :: [Ecto.Schema.t] | no_return
+
+  @doc """
+  Inserts all entries into the repository.
+
+  It expects a schema (`MyApp.User`) or a source (`"users"` or
+  `{"prefix", "users"}`) as the first argument. The second argument
+  is a list of entries to be inserted, either as keyword lists
+  or as maps.
+
+  It returns a tuple containing the number of entries
+  and any returned result as second element. If the database
+  does not support RETURNING in UPDATE statements or no
+  return result was selected, the second element will be `nil`.
+
+  When a schema is given, the values given will be properly dumped
+  before being sent to the database. If the schema contains an
+  autogenerated ID field, it will be handled either at the adapter
+  or the storage layer. However any other autogenerated value, like
+  timestamps, won't be autogenerated when using `c:insert_all/3`.
+  This is by design as this function aims to be a more direct way
+  to insert data into the database without the conveniences of
+  `c:insert/2`. This is also consistent with `c:update_all/3` that
+  does not handle timestamps as well.
+
+  If a source is given, without a schema, the given fields are passed
+  as is to the adapter.
+
+  ## Options
+
+    * `:returning` - selects which fields to return. When `true`,
+      returns all fields in the given struct. May be a list of
+      fields, where a struct is still returned but only with the
+      given fields. Or `false`, where nothing is returned (the default).
+      This option is not supported by all databases.
+
+  See the "Shared options" section at the module documentation for
+  remaining options.
+  """
+  @callback insert_all(schema_or_source :: binary | {binary | nil, binary} | Ecto.Schema.t,
+                       entries :: [map | Keyword.t], opts :: Keyword.t) :: {integer, nil | [term]} | no_return
 
   @doc """
   Updates all entries matching the given query with the given values.
@@ -373,21 +462,24 @@ defmodule Ecto.Repo do
   It returns a tuple containing the number of entries
   and any returned result as second element. If the database
   does not support RETURNING in UPDATE statements or no
-  return result was selected, the second element will be nil.
-  
+  return result was selected, the second element will be `nil`.
+
+  Keep in mind this `update_all` will not update autogenerated
+  fields like the `updated_at` columns.
+
   See `Ecto.Query.update/3` for update operations that can be
   performed on fields.
 
-  This operation does not run the model `before_update` and
-  `after_update` callbacks.
-
   ## Options
 
-    * `:timeout` - The time in milliseconds to wait for the query call to
-      finish, `:infinity` will wait indefinitely (default: 15000);
-    * `:pool_timeout` - The time in milliseconds to wait for calls to the pool
-      to finish, `:infinity` will wait indefinitely (default: 5000);
-    * `:log` - When false, does not log the query
+    * `:returning` - selects which fields to return. When `true`,
+      returns all fields in the given struct. May be a list of
+      fields, where a struct is still returned but only with the
+      given fields. Or `false`, where nothing is returned (the default).
+      This option is not supported by all databases.
+
+  See the "Shared options" section at the module documentation for
+  remaining options.
 
   ## Examples
 
@@ -400,8 +492,12 @@ defmodule Ecto.Repo do
 
       from(p in Post, where: p.id < 10, update: [set: [title: "New title"]])
       |> MyRepo.update_all([])
+
+      from(p in Post, where: p.id < 10, update: [set: [title: fragment("?", new_title)]])
+      |> MyRepo.update_all([])
   """
-  defcallback update_all(Macro.t, Keyword.t, Keyword.t) :: {integer, nil} | no_return
+  @callback update_all(queryable :: Ecto.Queryable.t, updates :: Keyword.t, opts :: Keyword.t) ::
+                       {integer, nil | [term]} | no_return
 
   @doc """
   Deletes all entries matching the given query.
@@ -409,18 +505,18 @@ defmodule Ecto.Repo do
   It returns a tuple containing the number of entries
   and any returned result as second element. If the database
   does not support RETURNING in DELETE statements or no
-  return result was selected, the second element will be nil.
-
-  This operation does not run the model `before_delete` and
-  `after_delete` callbacks.
+  return result was selected, the second element will be `nil`.
 
   ## Options
 
-    * `:timeout` - The time in milliseconds to wait for the query call to
-      finish, `:infinity` will wait indefinitely (default: 15000);
-    * `:pool_timeout` - The time in milliseconds to wait for calls to the pool
-      to finish, `:infinity` will wait indefinitely (default: 5000);
-    * `:log` - When false, does not log the query
+    * `:returning` - selects which fields to return. When `true`,
+      returns all fields in the given struct. May be a list of
+      fields, where a struct is still returned but only with the
+      given fields. Or `false`, where nothing is returned (the default).
+      This option is not supported by all databases.
+
+  See the "Shared options" section at the module documentation for
+  remaining options.
 
   ## Examples
 
@@ -428,147 +524,166 @@ defmodule Ecto.Repo do
 
       from(p in Post, where: p.id < 10) |> MyRepo.delete_all
   """
-  defcallback delete_all(Ecto.Queryable.t, Keyword.t) :: {integer, nil} | no_return
+  @callback delete_all(queryable :: Ecto.Queryable.t, opts :: Keyword.t) ::
+                       {integer, nil | [term]} | no_return
 
   @doc """
-  Inserts a model or a changeset.
+  Inserts a struct or a changeset.
 
-  In case a model is given, the model is converted into a changeset
-  with all model non-virtual fields as part of the changeset.
-  This conversion is done by calling `Ecto.Changeset.change/2` directly.
+  In case a struct is given, the struct is converted into a changeset
+  with all non-nil fields as part of the changeset.
 
   In case a changeset is given, the changes in the changeset are
-  merged with the model fields, and all of them are sent to the
+  merged with the struct fields, and all of them are sent to the
   database.
 
-  If any `before_insert` or `after_insert` callback is registered
-  in the given model, they will be invoked with the changeset.
-
-  It returns `{:ok, model}` if the model has been successfully
+  It returns `{:ok, struct}` if the struct has been successfully
   inserted or `{:error, changeset}` if there was a validation
   or a known constraint error.
 
   ## Options
 
-    * `:timeout` - The time in milliseconds to wait for the query call to
-      finish, `:infinity` will wait indefinitely (default: 15000);
-    * `:pool_timeout` - The time in milliseconds to wait for calls to the pool
-      to finish, `:infinity` will wait indefinitely (default: 5000);
-    * `:log` - When false, does not log the query
+  See the "Shared options" section at the module documentation.
 
   ## Example
 
       case MyRepo.insert %Post{title: "Ecto is great"} do
-        {:ok, model}        -> # Inserted with success
+        {:ok, struct}       -> # Inserted with success
         {:error, changeset} -> # Something went wrong
       end
 
   """
-  defcallback insert(Ecto.Model.t | Ecto.Changeset.t, Keyword.t) ::
-              {:ok, Ecto.Model.t} | {:error, Ecto.Changeset.t}
+  @callback insert(struct :: Ecto.Schema.t | Ecto.Changeset.t, opts :: Keyword.t) ::
+              {:ok, Ecto.Schema.t} | {:error, Ecto.Changeset.t}
 
   @doc """
-  Updates a model or changeset using its primary key.
+  Updates a changeset using its primary key.
 
-  In case a model is given, the model is converted into a changeset
-  with all model non-virtual fields as part of the changeset. This
-  conversion is done by calling `Ecto.Changeset.change/2` directly.
-  For this reason, it is preferred to use changesets when performing
-  updates as they perform dirty tracking and avoid sending data that
-  did not change to the database over and over. In case there are no
-  changes in the changeset, no data is sent to the database at all.
+  A changeset is required as it is the only mechanism for
+  tracking dirty changes.
 
-  In case a changeset is given, only the changes in the changeset
-  will be updated, leaving all the other model fields intact.
-
-  If any `before_update` or `after_update` callback are registered
-  in the given model, they will be invoked with the changeset.
-
-  If the model has no primary key, `Ecto.NoPrimaryKeyFieldError`
+  If the struct has no primary key, `Ecto.NoPrimaryKeyFieldError`
   will be raised.
 
-  It returns `{:ok, model}` if the model has been successfully
+  It returns `{:ok, struct}` if the struct has been successfully
   updated or `{:error, changeset}` if there was a validation
   or a known constraint error.
 
   ## Options
 
+  Besides the "Shared options" section at the module documentation,
+  it accepts:
+
     * `:force` - By default, if there are no changes in the changeset,
       `update!/2` is a no-op. By setting this option to true, update
       callbacks will always be executed, even if there are no changes
       (including timestamps).
-    * `:timeout` - The time in milliseconds to wait for the query call to
-      finish, `:infinity` will wait indefinitely (default: 15000);
-    * `:pool_timeout` - The time in milliseconds to wait for calls to the pool
-      to finish, `:infinity` will wait indefinitely (default: 5000);
-    * `:log` - When false, does not log the query
 
   ## Example
 
       post = MyRepo.get!(Post, 42)
       post = Ecto.Changeset.change post, title: "New title"
       case MyRepo.update post do
-        {:ok, model}        -> # Updated with success
+        {:ok, struct}       -> # Updated with success
         {:error, changeset} -> # Something went wrong
       end
   """
-  defcallback update(Ecto.Changeset.t, Keyword.t) ::
-              {:ok, Ecto.Model.t} | {:error, Ecto.Changeset.t}
+  @callback update(struct :: Ecto.Changeset.t, opts :: Keyword.t) ::
+              {:ok, Ecto.Schema.t} | {:error, Ecto.Changeset.t}
 
   @doc """
-  Deletes a model using its primary key.
+  Inserts or updates a changeset depending on whether the struct is persisted
+  or not.
 
-  If any `before_delete` or `after_delete` callback are registered
-  in the given model, they will be invoked with the changeset.
+  The distinction whether to insert or update will be made on the
+  `Ecto.Schema.Metadata` field `:state`. The `:state` is automatically set by
+  Ecto when loading or building a schema.
 
-  If the model has no primary key, `Ecto.NoPrimaryKeyFieldError`
+  Please note that for this to work, you will have to load existing structs from
+  the database. So even if the struct exists, this won't work:
+
+      struct = %Post{id: 'existing_id', ...}
+      MyRepo.insert_or_update changeset
+      # => {:error, "id already exists"}
+
+  ## Options
+
+  See the "Shared options" section at the module documentation.
+
+  ## Example
+
+      result =
+        case MyRepo.get(Post, id) do
+          nil  -> %Post{id: id} # Post not found, we build one
+          post -> post          # Post exists, let's use it
+        end
+        |> Post.changeset(changes)
+        |> MyRepo.insert_or_update
+
+      case result do
+        {:ok, struct}       -> # Inserted or updated with success
+        {:error, changeset} -> # Something went wrong
+      end
+  """
+  @callback insert_or_update(changeset :: Ecto.Changeset.t, opts :: Keyword.t) ::
+              {:ok, Ecto.Schema.t} | {:error, Ecto.Changeset.t}
+
+  @doc """
+  Deletes a struct using its primary key.
+
+  If the struct has no primary key, `Ecto.NoPrimaryKeyFieldError`
   will be raised.
 
-  It returns `{:ok, model}` if the model has been successfully
+  It returns `{:ok, struct}` if the struct has been successfully
   deleted or `{:error, changeset}` if there was a validation
   or a known constraint error.
 
   ## Options
 
-    * `:timeout` - The time in milliseconds to wait for the query call to
-      finish, `:infinity` will wait indefinitely (default: 15000);
-    * `:pool_timeout` - The time in milliseconds to wait for calls to the pool
-      to finish, `:infinity` will wait indefinitely (default: 5000);
-    * `:log` - When false, does not log the query
+  See the "Shared options" section at the module documentation.
 
   ## Example
 
-      [post] = MyRepo.all(from(p in Post, where: p.id == 42))
+      post = MyRepo.get!(Post, 42)
       case MyRepo.delete post do
-        {:ok, model}        -> # Deleted with success
+        {:ok, struct}       -> # Deleted with success
         {:error, changeset} -> # Something went wrong
       end
 
   """
-  defcallback delete(Ecto.Model.t, Keyword.t) ::
-              {:ok, Ecto.Model.t} | {:error, Ecto.Changeset.t}
+  @callback delete(struct :: Ecto.Schema.t, opts :: Keyword.t) ::
+              {:ok, Ecto.Schema.t} | {:error, Ecto.Changeset.t}
 
   @doc """
-  Same as `insert/2` but returns the model or raises if the changeset is invalid.
+  Same as `insert/2` but returns the struct or raises if the changeset is invalid.
   """
-  defcallback insert!(Ecto.Model.t, Keyword.t) :: Ecto.Model.t | no_return
+  @callback insert!(struct :: Ecto.Schema.t, opts :: Keyword.t) :: Ecto.Schema.t | no_return
 
   @doc """
-  Same as `update/2` but returns the model or raises if the changeset is invalid.
+  Same as `update/2` but returns the struct or raises if the changeset is invalid.
   """
-  defcallback update!(Ecto.Model.t, Keyword.t) :: Ecto.Model.t | no_return
+  @callback update!(struct :: Ecto.Schema.t, opts :: Keyword.t) :: Ecto.Schema.t | no_return
 
   @doc """
-  Same as `delete/2` but returns the model or raises if the changeset is invalid.
+  Same as `insert_or_update/2` but returns the struct or raises if the changeset
+  is invalid.
   """
-  defcallback delete!(Ecto.Model.t, Keyword.t) :: Ecto.Model.t | no_return
+  @callback insert_or_update!(changeset :: Ecto.Changeset.t, opts :: Keyword.t) ::
+              Ecto.Schema.t | no_return
 
   @doc """
-  Runs the given function inside a transaction.
+  Same as `delete/2` but returns the struct or raises if the changeset is invalid.
+  """
+  @callback delete!(struct :: Ecto.Schema.t, opts :: Keyword.t) :: Ecto.Schema.t | no_return
+
+  @doc """
+  Runs the given function or `Ecto.Multi` inside a transaction.
+
+  ## Use with function
 
   If an unhandled error occurs the transaction will be rolled back
   and the error will bubble up from the transaction function.
-  If no error occurred the transaction will be commited when the
+  If no error occurred the transaction will be committed when the
   function returns. A transaction can be explicitly rolled back
   by calling `rollback/1`, this will immediately leave the function
   and return the value given to `rollback` as `{:error, value}`.
@@ -580,15 +695,23 @@ defmodule Ecto.Repo do
   is simply executed, without wrapping the new transaction call in any
   way. If there is an error in the inner transaction and the error is
   rescued, or the inner transaction is rolled back, the whole outer
-  transaction is marked as tainted, guaranteeing nothing will be comitted.
+  transaction is marked as tainted, guaranteeing nothing will be committed.
+
+  ## Use with Ecto.Multi
+
+  Besides functions transaction can be used with an Ecto.Multi struct.
+  Transaction will be started, all operations applied and in case of
+  success committed returning `{:ok, changes}`. In case of any errors
+  the transaction will be rolled back and
+  `{:error, failed_operation, failed_value, changes_so_far}` will be
+  returned.
+
+  You can read more about using transactions with `Ecto.Multi` as well as
+  see some examples in the `Ecto.Multi` documentation.
 
   ## Options
 
-    * `:timeout` - The time in milliseconds to wait for the query call to
-      finish, `:infinity` will wait indefinitely (default: 15000);
-    * `:pool_timeout` - The time in milliseconds to wait for calls to the pool
-      to finish, `:infinity` will wait indefinitely (default: 5000);
-    * `:log` - When false, does not log begin/commit/rollback queries
+  See the "Shared options" section at the module documentation.
 
   ## Examples
 
@@ -605,32 +728,34 @@ defmodule Ecto.Repo do
         end
       end)
 
+      # With Ecto.Multi
+      Ecto.Multi.new
+      |> Ecto.Multi.insert(:post, %Post{})
+      |> MyRepo.transaction
+
   """
-  defcallback transaction(Keyword.t, fun) :: {:ok, any} | {:error, any}
+  @callback transaction(fun_or_multi :: fun | Ecto.Multi.t, opts :: Keyword.t) ::
+    {:ok, any} | {:error, any} | {:error, atom, any, %{atom => any}}
+
+  @doc """
+  Returns true if the current process is inside a transaction.
+
+  ## Examples
+
+      MyRepo.in_transaction?
+      #=> false
+
+      MyRepo.transaction(fn ->
+        MyRepo.in_transaction? #=> true
+      end)
+
+  """
+  @callback in_transaction?() :: boolean
 
   @doc """
   Rolls back the current transaction.
 
   The transaction will return the value given as `{:error, value}`.
   """
-  defcallback rollback(any) :: no_return
-
-  @doc ~S"""
-  Enables logging of adapter actions such as sending queries to the database.
-
-  By default writes to Logger but can be overriden to customize behaviour.
-
-  ## Examples
-
-  The default implementation of the `log/1` function is shown below:
-
-      def log(entry) do
-        Logger.debug(fn ->
-          {_entry, iodata} = Ecto.LogEntry.to_iodata(entry)
-          iodata
-        end, ecto_conn_pid: entry.connection_pid)
-      end
-
-  """
-  defcallback log(Ecto.LogEntry.t) :: any
+  @callback rollback(value :: any) :: no_return
 end

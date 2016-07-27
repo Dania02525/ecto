@@ -1,5 +1,5 @@
 defmodule Inspect.Post do
-  use Ecto.Model
+  use Ecto.Schema
 
   schema "posts" do
     field :visits, :integer
@@ -9,7 +9,7 @@ defmodule Inspect.Post do
 end
 
 defmodule Inspect.Comment do
-  use Ecto.Model
+  use Ecto.Schema
 
   schema "comments" do
   end
@@ -34,6 +34,9 @@ defmodule Ecto.Query.InspectTest do
 
     assert i(from(x in {"user_posts", Post}, [])) ==
            ~s[from p in {"user_posts", Inspect.Post}]
+
+    assert i(from(subquery(Post), [])) ==
+           ~s{from p in subquery(from p in Inspect.Post)}
   end
 
   test "join" do
@@ -54,6 +57,9 @@ defmodule Ecto.Query.InspectTest do
 
     assert i(from(x in Post, inner_join: y in fragment("foo ? and ?", x.id, ^1), on: y.id == x.id)) ==
            ~s{from p in Inspect.Post, join: f in fragment("foo ? and ?", p.id, ^1), on: f.id == p.id}
+
+    assert i(from(x in Post, join: y in subquery(Comment), on: x.id == y.id)) ==
+           ~s{from p in Inspect.Post, join: c in subquery(from c in Inspect.Comment), on: p.id == c.id}
   end
 
   test "where" do
@@ -116,7 +122,7 @@ defmodule Ecto.Query.InspectTest do
            ~s{from p in Inspect.Post, where: fragment("downcase(?) == ?", p.id, ^"foobar")}
 
     assert i(from(x in Post, where: fragment(^[title: [foo: "foobar"]]))) ==
-           ~s{from p in Inspect.Post, where: fragment(^[title: [foo: "foobar"]])}
+           ~s{from p in Inspect.Post, where: fragment(title: [foo: "foobar"])}
 
     assert i(from(x in Post, where: fragment(title: [foo: ^value]))) ==
       ~s{from p in Inspect.Post, where: fragment(title: [foo: ^"foobar"])}
@@ -169,19 +175,41 @@ defmodule Ecto.Query.InspectTest do
            "from p in Inspect.Post, select: <<1, 2, 3>>"
 
     foo = <<1, 2, 3>>
-    assert i(from(Post, select: ^foo)) ==
-           "from p in Inspect.Post, select: ^<<1, 2, 3>>"
+    assert i(from(p in Post, select: {p, ^foo})) ==
+           "from p in Inspect.Post, select: {p, ^<<1, 2, 3>>}"
+  end
+
+  test "select" do
+    assert i(from(p in Post, select: p)) ==
+           ~s{from p in Inspect.Post, select: p}
+
+    assert i(from(p in Post, select: [:foo])) ==
+           ~s{from p in Inspect.Post, select: [:foo]}
+
+    assert i(from(p in Post, select: struct(p, [:foo]))) ==
+           ~s{from p in Inspect.Post, select: struct(p, [:foo])}
+  end
+
+  test "select after planner" do
+    assert i(plan from(p in Post, select: p)) ==
+           ~s{from p in Inspect.Post, select: p}
+
+    assert i(plan from(p in Post, select: [:foo])) ==
+           ~s{from p in Inspect.Post, select: [:foo]}
   end
 
   test "params" do
     assert i(from(x in Post, where: ^123 > ^(1 * 3))) ==
            ~s{from p in Inspect.Post, where: ^123 > ^3}
+
+    assert i(from(x in Post, where: x.id in ^[97])) ==
+           ~s{from p in Inspect.Post, where: p.id in ^[97]}
   end
 
   test "params after planner" do
     query = plan from(x in Post, where: ^123 > ^(1 * 3) and x.id in ^[1, 2, 3])
     assert i(query) ==
-           ~s{from p in Inspect.Post, where: ^... > ^... and p.id in ^..., select: p}
+           ~s{from p in Inspect.Post, where: ^... > ^... and p.id in ^...}
   end
 
   test "tagged types" do

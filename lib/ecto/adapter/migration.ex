@@ -3,8 +3,6 @@ defmodule Ecto.Adapter.Migration  do
   Specifies the adapter migrations API.
   """
 
-  use Behaviour
-
   alias Ecto.Migration.Table
   alias Ecto.Migration.Index
   alias Ecto.Migration.Reference
@@ -37,9 +35,8 @@ defmodule Ecto.Adapter.Migration  do
 
   @doc """
   Checks if the adapter supports ddl transaction.
-
   """
-  defcallback supports_ddl_transaction? :: boolean
+  @callback supports_ddl_transaction? :: boolean
 
   @doc """
   Executes migration commands.
@@ -52,5 +49,5 @@ defmodule Ecto.Adapter.Migration  do
       to finish, `:infinity` will wait indefinitely (default: 5000);
     * `:log` - When false, does not log begin/commit/rollback queries
   """
-  defcallback execute_ddl(Ecto.Repo.t, command, Keyword.t) :: :ok | no_return
+  @callback execute_ddl(repo :: Ecto.Repo.t, command, options :: Keyword.t) :: :ok | no_return
 end

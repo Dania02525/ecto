@@ -4,49 +4,36 @@ defmodule Ecto.LogEntryTest do
   alias  Ecto.LogEntry
   import Ecto.LogEntry
 
-  test "can be resolved" do
-    entry = %LogEntry{query: fn %LogEntry{} -> "done" end}
-
-    # Resolve once
-    entry = resolve(entry)
-    assert entry.query == "done"
-
-    # It can also be resolved multiple times
-    entry = resolve(entry)
-    assert entry.query == "done"
-  end
-
   test "converts entry to iodata" do
     entry = %LogEntry{query: "done", result: {:ok, []}}
-    assert to_binary(entry) == "done [] OK"
+    assert to_binary(entry) == "QUERY OK\ndone []"
 
     entry = %{entry | params: [1, 2, 3], result: {:ok, []}}
-    assert to_binary(entry) == "done [1, 2, 3] OK"
+    assert to_binary(entry) == "QUERY OK\ndone [1, 2, 3]"
 
     entry = %{entry | params: [9, 10, 11]}
-    assert to_binary(entry) == "done [9, 10, 11] OK"
+    assert to_binary(entry) == "QUERY OK\ndone [9, 10, 11]"
 
     entry = %{entry | params: [%Ecto.Query.Tagged{value: 1}, 2, 3]}
-    assert to_binary(entry) == "done [1, 2, 3] OK"
+    assert to_binary(entry) == "QUERY OK\ndone [1, 2, 3]"
 
     entry = %{entry | params: [1, 2, 3], query_time: 0}
-    assert to_binary(entry) == "done [1, 2, 3] OK query=0.0ms"
+    assert to_binary(entry) == "QUERY OK db=0.0ms\ndone [1, 2, 3]"
 
     entry = %{entry | params: [1, 2, 3], query_time: 0, queue_time: 0}
-    assert to_binary(entry) == "done [1, 2, 3] OK query=0.0ms"
+    assert to_binary(entry) == "QUERY OK db=0.0ms\ndone [1, 2, 3]"
 
-    entry = %{entry | params: [1, 2, 3], query_time: 2100, queue_time: 100}
-    assert to_binary(entry) == "done [1, 2, 3] OK query=2.1ms queue=0.1ms"
+    diff = :erlang.convert_time_unit(1, :micro_seconds, :native)
+    entry = %{entry | params: [1, 2, 3], query_time: 2100 * diff, queue_time: 100 * diff}
+    assert to_binary(entry) == "QUERY OK db=2.1ms queue=0.1ms\ndone [1, 2, 3]"
 
-    entry = %{entry | params: [1, 2, 3], query_time: 2100, queue_time: 100, result: {:error, :error}}
-    assert to_binary(entry) == "done [1, 2, 3] ERROR query=2.1ms queue=0.1ms"
-  end
+    entry = %{entry | params: [1, 2, 3], query_time: 2100 * diff, queue_time: 100 * diff,
+                                         result: {:error, :error}}
+    assert to_binary(entry) == "QUERY ERROR db=2.1ms queue=0.1ms\ndone [1, 2, 3]"
 
-  test "resolves when converting entry to iodata" do
-    entry = %LogEntry{query: fn _ -> "done" end, params: [], result: {:ok, []}}
-    {entry, iodata} = to_iodata(entry)
-    assert entry.query == "done"
-    assert IO.iodata_to_binary(iodata) == "done [] OK"
+    entry = %{entry | params: [1, 2, 3], query_time: 2100 * diff, decode_time: 500 * diff,
+                                         queue_time: 100 * diff, result: {:error, :error}}
+    assert to_binary(entry) == "QUERY ERROR db=2.1ms decode=0.5ms queue=0.1ms\ndone [1, 2, 3]"
   end
 
   defp to_binary(entry) do

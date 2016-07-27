@@ -1,8 +1,6 @@
 defmodule Ecto.Query.Builder do
   @moduledoc false
 
-  @distinct ~w(count)a
-
   alias Ecto.Query
 
   @typedoc """
@@ -65,10 +63,11 @@ defmodule Ecto.Query.Builder do
     {{:{}, [], [:fragment, [], [escaped]]}, params}
   end
 
-  def escape({:fragment, _, [{:^, _, _} = expr]}, _type, params, vars, env) do
-    {escaped, params} = escape(expr, :any, params, vars, env)
-
-    {{:{}, [], [:fragment, [], [escaped]]}, params}
+  def escape({:fragment, _, [{:^, _, [var]} = _expr]}, _type, params, _vars, _env) do
+    expr = quote do
+      Ecto.Query.Builder.runtime_validate!(unquote(var))
+    end
+    {{:{}, [], [:fragment, [], [expr]]}, params}
   end
 
   def escape({:fragment, _, [query|frags]}, _type, params, vars, env) when is_binary(query) do
@@ -88,6 +87,25 @@ defmodule Ecto.Query.Builder do
   end
 
   # interval
+
+  def escape({:from_now, meta, [count, interval]}, type, params, vars, env) do
+    utc = quote do: ^Ecto.DateTime.utc
+    escape({:datetime_add, meta, [utc, count, interval]}, type, params, vars, env)
+  end
+
+  def escape({:ago, meta, [count, interval]}, type, params, vars, env) do
+    utc = quote do: ^Ecto.DateTime.utc
+    count =
+      case count do
+        {:^, meta, [value]} ->
+          negate = quote do: Ecto.Query.Builder.negate!(unquote(value))
+          {:^, meta, [negate]}
+        value ->
+          {:-, [], [value]}
+      end
+    escape({:datetime_add, meta, [utc, count, interval]}, type, params, vars, env)
+  end
+
   def escape({:datetime_add, _, [datetime, count, interval]} = expr, type, params, vars, env) do
     assert_type!(expr, type, :datetime)
     {datetime, params} = escape(datetime, :datetime, params, vars, env)
@@ -147,7 +165,7 @@ defmodule Ecto.Query.Builder do
 
     if is_nil(left) or is_nil(right) do
       error! "comparison with nil is forbidden as it always evaluates to false. " <>
-             "If you want to check if a value is (not) nil, use is_nil/1 instead"
+             "If you want to check if a value is nil, use is_nil/1 instead"
     end
 
     ltype = quoted_type(right, vars)
@@ -172,28 +190,34 @@ defmodule Ecto.Query.Builder do
     {{:{}, [], [:in, [], [left, right]]}, params}
   end
 
-  def escape({:in, _, [left, {:^, _, _} = right]} = expr, type, params, vars, env) do
-    assert_type!(expr, type, :boolean)
-
-    # The rtype in will be unwrapped in the query planner
-    ltype = :any
-    rtype = {:in_spread, quoted_type(left, vars)}
-
-    {left,  params} = escape(left, ltype, params, vars, env)
-    {right, params} = escape(right, rtype, params, vars, env)
-    {{:{}, [], [:in, [], [left, right]]}, params}
-  end
-
   def escape({:in, _, [left, right]} = expr, type, params, vars, env) do
     assert_type!(expr, type, :boolean)
 
-    ltype = quoted_type(right, vars)
-    rtype = {:array, quoted_type(left, vars)}
+    ltype = {:out, quoted_type(right, vars)}
+    rtype = {:in, quoted_type(left, vars)}
 
-    # The ltype in will be unwrapped in the query planner
-    {left,  params} = escape(left, {:in_array, ltype}, params, vars, env)
+    {left,  params} = escape(left, ltype, params, vars, env)
     {right, params} = escape(right, rtype, params, vars, env)
+
+    # Remove any type wrapper from the right side
+    right =
+      case right do
+        {:{}, [], [:type, [], [right, _]]} -> right
+        _ -> right
+      end
+
     {{:{}, [], [:in, [], [left, right]]}, params}
+  end
+
+  def escape({:count, _, [arg, :distinct]}, type, params, vars, env) do
+    {arg, params} = escape(arg, type, params, vars, env)
+    expr = {:{}, [], [:count, [], [arg, :distinct]]}
+    {expr, params}
+  end
+
+  def escape({op, _, _}, _type, _params, _vars, _env) when op in ~w(|| && !)a do
+    error! "short-circuit operators are not supported: `#{op}`. " <>
+           "Instead use boolean operators: `and`, `or`, and `not`"
   end
 
   # Other functions - no type casting
@@ -218,17 +242,20 @@ defmodule Ecto.Query.Builder do
     error! "`#{Macro.to_string(other)}` is not a valid query expression"
   end
 
+  def runtime_validate!(kw) do
+    unless Keyword.keyword?(kw) do
+      raise ArgumentError, "to prevent sql injection, only a keyword list may be interpolated " <>
+                           "as the first argument to `fragment/1` with the `^` operator, got `#{inspect kw}`"
+    end
+
+    kw
+  end
+
   defp split_binary(query), do: split_binary(query, "")
   defp split_binary(<<>>, consumed), do: [consumed]
   defp split_binary(<<??, rest :: binary >>, consumed), do: [consumed | split_binary(rest, "")]
   defp split_binary(<<?\\, ??, rest :: binary >>, consumed), do: split_binary(rest, consumed <> <<??>>)
   defp split_binary(<<first :: utf8, rest :: binary>>, consumed), do: split_binary(rest, consumed <> <<first>>)
-
-  defp escape_call({name, _, [arg, :distinct]}, type, params, vars, env) when name in @distinct do
-    {arg, params} = escape(arg, type, params, vars, env)
-    expr = {:{}, [], [name, [], [arg, :distinct]]}
-    {expr, params}
-  end
 
   defp escape_call({name, _, args}, type, params, vars, env) do
     {args, params} = Enum.map_reduce(args, params, &escape(&1, type, &2, vars, env))
@@ -274,8 +301,7 @@ defmodule Ecto.Query.Builder do
   defp merge_fragments([h1], []),
     do: [{:raw, h1}]
 
-  defp call_type(agg, 1)  when agg in ~w(max count sum min avg)a, do: {:any, :any}
-  defp call_type(agg, 2)  when agg in @distinct,                  do: {:any, :any}
+  defp call_type(agg, 1)  when agg in ~w(avg count max min sum)a, do: {:any, :any}
   defp call_type(comp, 2) when comp in ~w(== != < > <= >=)a,      do: {:any, :boolean}
   defp call_type(like, 2) when like in ~w(like ilike)a,           do: {:string, :boolean}
   defp call_type(bool, 2) when bool in ~w(and or)a,               do: {:boolean, :boolean}
@@ -297,11 +323,17 @@ defmodule Ecto.Query.Builder do
     end
   end
 
-  defp validate_type!({:array, {:__aliases__, _, _}} = type, _vars), do: {type, type}
-  defp validate_type!({:array, atom} = type, _vars) when is_atom(atom), do: {type, type}
-  defp validate_type!({:__aliases__, _, _} = type, _vars), do: {type, type}
-  defp validate_type!(type, _vars) when is_atom(type), do: {type, type}
+  defp validate_type!({composite, type}, vars) do
+    {type, escaped} = validate_type!(type, vars)
+    {{composite, type}, {composite, escaped}}
+  end
 
+  defp validate_type!({:^, _, [type]}, _vars),
+    do: {type, type}
+  defp validate_type!({:__aliases__, _, _} = type, _vars),
+    do: {type, type}
+  defp validate_type!(type, _vars) when is_atom(type),
+    do: {type, type}
   defp validate_type!({{:., _, [{var, _, context}, field]}, _, []}, vars)
     when is_atom(var) and is_atom(context) and is_atom(field),
     do: {{find_var!(var, vars), field}, escape_field(var, field, vars)}
@@ -310,7 +342,7 @@ defmodule Ecto.Query.Builder do
     do: {{find_var!(var, vars), field}, escape_field(var, field, vars)}
 
   defp validate_type!(type, _vars) do
-    error! "type/2 expects an alias, atom or source.field as second argument, got: `#{Macro.to_string(type)}"
+    error! "type/2 expects an alias, atom or source.field as second argument, got: `#{Macro.to_string(type)}`"
   end
 
   @always_tagged [:binary]
@@ -318,7 +350,7 @@ defmodule Ecto.Query.Builder do
   defp literal(value, expected, vars),
     do: do_literal(value, expected, quoted_type(value, vars))
 
-  defp do_literal(value, :any, current) when current in @always_tagged,
+  defp do_literal(value, _, current) when current in @always_tagged,
     do: {:%, [], [Ecto.Query.Tagged, {:%{}, [], [value: value, type: current]}]}
   defp do_literal(value, :any, _current),
     do: value
@@ -453,6 +485,16 @@ defmodule Ecto.Query.Builder do
     do: error!("invalid interval: `#{inspect other}` (expected one of #{Enum.join(@interval, ", ")})")
 
   @doc """
+  Negates the given number.
+  """
+  def negate!(%Decimal{} = decimal) do
+    Decimal.minus(decimal)
+  end
+  def negate!(number) when is_number(number) do
+    -number
+  end
+
+  @doc """
   Returns the type of an expression at build time.
   """
   @spec quoted_type(Macro.t, Keyword.t) :: quoted_type
@@ -498,6 +540,13 @@ defmodule Ecto.Query.Builder do
   def quoted_type({:-, _, [number]}, _vars) when is_integer(number), do: :integer
   def quoted_type({:-, _, [number]}, _vars) when is_float(number), do: :float
 
+  # Aggregates
+  def quoted_type({:count, _, [_, _]}, _vars), do: :integer
+  def quoted_type({:count, _, [_]}, _vars), do: :integer
+  def quoted_type({agg, _, [expr]}, vars) when agg in [:avg, :max, :min, :sum] do
+    quoted_type(expr, vars)
+  end
+
   # Literals
   def quoted_type(literal, _vars) when is_float(literal),   do: :float
   def quoted_type(literal, _vars) when is_binary(literal),  do: :string
@@ -517,7 +566,7 @@ defmodule Ecto.Query.Builder do
   Raises a query building error.
   """
   def error!(message) when is_binary(message) do
-    {:current_stacktrace, [_|t]} = Process.info(self, :current_stacktrace)
+    {:current_stacktrace, [_|t]} = Process.info(self(), :current_stacktrace)
 
     t = Enum.drop_while t, fn
       {mod, _, _, _} ->
@@ -535,16 +584,12 @@ defmodule Ecto.Query.Builder do
   ## Examples
 
       iex> count_binds(%Ecto.Query{joins: [1,2,3]})
-      3
-
-      iex> count_binds(%Ecto.Query{from: 0, joins: [1,2]})
-      3
+      4
 
   """
   @spec count_binds(Ecto.Query.t) :: non_neg_integer
-  def count_binds(%Query{from: from, joins: joins}) do
-    count = if from, do: 1, else: 0
-    count + length(joins)
+  def count_binds(%Query{joins: joins}) do
+    1 + length(joins)
   end
 
   @doc """

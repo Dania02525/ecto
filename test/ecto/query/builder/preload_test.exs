@@ -13,6 +13,12 @@ defmodule Ecto.Query.Builder.PreloadTest do
     assert_raise Ecto.Query.CompileError, ~r"`1` is not a valid preload expression", fn ->
       quote_and_eval(%Ecto.Query{} |> preload(1))
     end
+
+    message = "expected key in preload to be an atom, got: `1`"
+    assert_raise ArgumentError, message, fn ->
+      temp = 1
+      preload(%Ecto.Query{}, [{^temp, :foo}])
+    end
   end
 
   test "preload accumulates" do
@@ -28,8 +34,14 @@ defmodule Ecto.Query.Builder.PreloadTest do
     assert preload("posts", [users: ^[comments]]).preloads == [users: [:comments]]
     assert preload("posts", [{^:users, ^comments}]).preloads == [users: :comments]
 
-    query = from c in "comments", limit: 10
+    query = from u in "users", limit: 10
     assert preload("posts", [users: ^query]).preloads == [users: query]
     assert preload("posts", [{^:users, ^query}]).preloads == [users: query]
+    assert preload("posts", [users: ^{query, :comments}]).preloads == [users: {query, :comments}]
+
+    fun = fn _ -> [] end
+    assert preload("posts", [users: ^fun]).preloads == [users: fun]
+    assert preload("posts", [{^:users, ^fun}]).preloads == [users: fun]
+    assert preload("posts", [users: ^{fun, :comments}]).preloads == [users: {fun, :comments}]
   end
 end

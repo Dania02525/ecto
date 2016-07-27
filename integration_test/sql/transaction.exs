@@ -1,14 +1,16 @@
 defmodule Ecto.Integration.TransactionTest do
   # We can keep this test async as long as it
   # is the only one access the transactions table
-  use ExUnit.Case, async: true
+  use Ecto.Integration.Case, async: true
 
   import Ecto.Query
-  alias Ecto.Integration.PoolRepo
-  alias Ecto.Integration.TestRepo
+  alias Ecto.Integration.PoolRepo # Used for writes
+  alias Ecto.Integration.TestRepo # Used for reads
+
+  @moduletag :capture_log
 
   defmodule UniqueError do
-    defexception [:message]
+    defexception message: "unique error"
   end
 
   setup do
@@ -17,7 +19,7 @@ defmodule Ecto.Integration.TransactionTest do
   end
 
   defmodule Trans do
-    use Ecto.Model
+    use Ecto.Schema
 
     schema "transactions" do
       field :text, :string
@@ -25,12 +27,19 @@ defmodule Ecto.Integration.TransactionTest do
   end
 
   test "transaction returns value" do
-    x = PoolRepo.transaction(fn ->
-      PoolRepo.transaction(fn ->
-        42
-      end)
+    refute PoolRepo.in_transaction?
+    {:ok, val} = PoolRepo.transaction(fn ->
+      assert PoolRepo.in_transaction?
+      {:ok, val} =
+        PoolRepo.transaction(fn ->
+          assert PoolRepo.in_transaction?
+          42
+        end)
+      assert PoolRepo.in_transaction?
+      val
     end)
-    assert x == {:ok, {:ok, 42}}
+    refute PoolRepo.in_transaction?
+    assert val == 42
   end
 
   test "transaction re-raises" do
@@ -50,7 +59,7 @@ defmodule Ecto.Integration.TransactionTest do
       assert [] = TestRepo.all(Trans)
     end)
 
-    assert [%Trans{text: "1"}] = TestRepo.all(Trans)
+    assert [%Trans{text: "1"}] = PoolRepo.all(Trans)
   end
 
   test "transaction rolls back" do
@@ -97,7 +106,8 @@ defmodule Ecto.Integration.TransactionTest do
         UniqueError -> :ok
       end
 
-      assert {:noconnect, _} = catch_exit(PoolRepo.insert!(%Trans{text: "5"}))
+      assert_raise DBConnection.ConnectionError, "transaction rolling back",
+        fn() -> PoolRepo.insert!(%Trans{text: "5"}) end
     end) == {:error, :rollback}
 
     assert TestRepo.all(Trans) == []
@@ -115,21 +125,21 @@ defmodule Ecto.Integration.TransactionTest do
   end
 
   test "manual rollback bubbles up on nested transaction" do
-    x = PoolRepo.transaction(fn ->
+    assert PoolRepo.transaction(fn ->
       e = PoolRepo.insert!(%Trans{text: "6"})
       assert [^e] = PoolRepo.all(Trans)
       assert {:error, :oops} = PoolRepo.transaction(fn ->
         PoolRepo.rollback(:oops)
       end)
-      assert {:noconnect, _} = catch_exit(PoolRepo.insert!(%Trans{text: "5"}))
-    end)
+      assert_raise DBConnection.ConnectionError, "transaction rolling back",
+        fn() -> PoolRepo.insert!(%Trans{text: "5"}) end
+    end) == {:error, :rollback}
 
-    assert x == {:error, :rollback}
     assert [] = TestRepo.all(Trans)
   end
 
   test "transactions are not shared in repo" do
-    pid = self
+    pid = self()
 
     new_pid = spawn_link fn ->
       PoolRepo.transaction(fn ->
@@ -162,26 +172,63 @@ defmodule Ecto.Integration.TransactionTest do
     assert [%Trans{text: "7"}] = PoolRepo.all(Trans)
   end
 
-  ## Failures when logging
+  ## Logging
+
+  test "log begin, commit and rollback" do
+    Process.put(:on_log, &send(self(), &1))
+    PoolRepo.transaction(fn ->
+      assert_received %Ecto.LogEntry{params: [], result: {:ok, _}} = entry
+      assert is_integer(entry.query_time) and entry.query_time >= 0
+      assert is_integer(entry.queue_time) and entry.queue_time >= 0
+
+      refute_received %Ecto.LogEntry{}
+      Process.put(:on_log, &send(self(), &1))
+    end)
+
+    assert_received %Ecto.LogEntry{params: [], result: {:ok, _}} = entry
+    assert is_integer(entry.query_time) and entry.query_time >= 0
+    assert is_nil(entry.queue_time)
+
+    assert PoolRepo.transaction(fn ->
+      refute_received %Ecto.LogEntry{}
+      Process.put(:on_log, &send(self(), &1))
+      PoolRepo.rollback(:log_rollback)
+    end) == {:error, :log_rollback}
+    assert_received %Ecto.LogEntry{params: [], result: {:ok, _}} = entry
+    assert is_integer(entry.query_time) and entry.query_time >= 0
+    assert is_nil(entry.queue_time)
+  end
+
+  test "log queries inside transactions" do
+    PoolRepo.transaction(fn ->
+      Process.put(:on_log, &send(self(), &1))
+      assert [] = PoolRepo.all(Trans)
+
+      assert_received %Ecto.LogEntry{params: [], result: {:ok, _}} = entry
+      assert is_integer(entry.query_time) and entry.query_time >= 0
+      assert is_integer(entry.decode_time) and entry.query_time >= 0
+      assert is_nil(entry.queue_time)
+    end)
+  end
 
   @tag :strict_savepoint
   test "log raises after begin, drops transaction" do
     try do
-      Process.put(:on_log, fn -> raise UniqueError end)
-      PoolRepo.transaction(fn -> end)
+      Process.put(:on_log, fn _ -> raise UniqueError end)
+      PoolRepo.transaction(fn -> :ok end)
     rescue
       UniqueError -> :ok
     end
 
     # If it doesn't fail, the transaction was not closed properly.
-    catch_error(Ecto.Adapters.SQL.query!(PoolRepo, "savepoint foobar", []))
+    catch_error(PoolRepo.query!("savepoint foobar"))
   end
 
   test "log raises after begin, drops the whole transaction" do
     try do
       PoolRepo.transaction(fn ->
         PoolRepo.insert!(%Trans{text: "8"})
-        Process.put(:on_log, fn -> raise UniqueError end)
+        Process.put(:on_log, fn _ -> raise UniqueError end)
         PoolRepo.transaction(fn -> flunk "log did not raise" end)
       end)
     rescue
@@ -195,7 +242,7 @@ defmodule Ecto.Integration.TransactionTest do
     try do
       PoolRepo.transaction(fn ->
         PoolRepo.insert!(%Trans{text: "10"})
-        Process.put(:on_log, fn -> raise UniqueError end)
+        Process.put(:on_log, fn _ -> raise UniqueError end)
       end)
     rescue
       UniqueError -> :ok
@@ -208,7 +255,7 @@ defmodule Ecto.Integration.TransactionTest do
     try do
       PoolRepo.transaction(fn ->
         PoolRepo.insert!(%Trans{text: "11"})
-        Process.put(:on_log, fn -> raise UniqueError end)
+        Process.put(:on_log, fn _ -> raise UniqueError end)
         PoolRepo.rollback(:rollback)
       end)
     rescue
@@ -217,31 +264,4 @@ defmodule Ecto.Integration.TransactionTest do
 
     assert [] = PoolRepo.all(Trans)
   end
-
-  ## Timeouts
-  # Those tests are very sensitive to timeouts and
-  # may fail in CI servers and similar. They are
-  # tagged so they can be easily skipped.
-
-  # TODO: Uncomment those tests with Elixir 1.1
-  # and by default exclude the tests in build
-
-  # @tag :timeout_sensitive
-  # test "transaction exit includes :timeout on begin timeout" do
-  #   assert match?({:timeout, _},
-  #     catch_exit(PoolRepo.transaction([timeout: 0], fn ->
-  #       flunk "did not timeout"
-  #     end)))
-  # end
-
-  # @tag :timeout_sensitive
-  # test "transaction exit includes :timeout on query timeout" do
-  #   assert match?({:timeout, _},
-  #     catch_exit(PoolRepo.transaction(fn ->
-  #       PoolRepo.transaction(fn ->
-  #         PoolRepo.insert!(%Trans{text: "13"}, [timeout: 0])
-  #       end)
-  #     end)))
-  #   assert [] = PoolRepo.all(Trans)
-  # end
 end

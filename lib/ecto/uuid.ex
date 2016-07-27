@@ -1,15 +1,12 @@
 defmodule Ecto.UUID do
   @moduledoc """
   An Ecto type for UUIDs strings.
-
-  In contrast to the `:uuid` type, `Ecto.UUID` works
-  with UUID as strings instead of binary data.
   """
 
   @behaviour Ecto.Type
 
   @doc """
-  The Ecto primitive type.
+  The Ecto type.
   """
   def type, do: :uuid
 
@@ -40,7 +37,7 @@ defmodule Ecto.UUID do
       :error -> :error
     else
       binary ->
-        {:ok, %Ecto.Query.Tagged{type: :uuid, value: binary}}
+        {:ok, binary}
     end
   end
   def dump(_), do: :error
@@ -74,12 +71,15 @@ defmodule Ecto.UUID do
   @doc """
   Converts a binary UUID into a string.
   """
-  def load(<< _::128 >> = uuid) do
+  def load(<<_::128>> = uuid) do
    {:ok, encode(uuid)}
   end
   def load(<<_::64, ?-, _::32, ?-, _::32, ?-, _::32, ?-, _::96>> = string) do
     raise "trying to load string UUID as Ecto.UUID: #{inspect string}. " <>
           "Maybe you wanted to declare :uuid as your database field?"
+  end
+  def load(%Ecto.Query.Tagged{type: :uuid, value: uuid}) do
+    {:ok, encode(uuid)}
   end
   def load(_), do: :error
 
@@ -97,6 +97,10 @@ defmodule Ecto.UUID do
     <<u0::48, _::4, u1::12, _::2, u2::62>> = :crypto.strong_rand_bytes(16)
     <<u0::48, 4::4, u1::12, 2::2, u2::62>>
   end
+
+  # Callback invoked by autogenerate fields.
+  @doc false
+  def autogenerate, do: generate()
 
   defp encode(<<u0::32, u1::16, u2::16, u3::16, u4::48>>) do
     hex_pad(u0, 8) <> "-" <>

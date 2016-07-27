@@ -1,13 +1,17 @@
 defmodule Mix.Tasks.Ecto.Gen.Migration do
   use Mix.Task
-  import Mix.Ecto
-  import Mix.Generator
-  import Mix.Utils, only: [camelize: 1, underscore: 1]
 
-  @shortdoc "Generate a new migration for the repo"
+  import Macro, only: [camelize: 1, underscore: 1]
+  import Mix.Generator
+  import Mix.Ecto
+
+  @shortdoc "Generates a new migration for the repo"
 
   @moduledoc """
   Generates a migration.
+
+  The repository must be set under `:ecto_repos` in the
+  current app configuration or given via the `-r` option.
 
   ## Examples
 
@@ -16,18 +20,19 @@ defmodule Mix.Tasks.Ecto.Gen.Migration do
 
   By default, the migration will be generated to the
   "priv/YOUR_REPO/migrations" directory of the current application
-  but it can be configured by specify the `:priv` key under
-  the repository configuration.
+  but it can be configured to be any subdirectory of `priv` by
+  specifying the `:priv` key under the repository configuration.
 
   This generator will automatically open the generated file if
   you have `ECTO_EDITOR` set in your environment variable.
 
   ## Command line options
 
-    * `-r`, `--repo` - the repo to generate migration for (defaults to `YourApp.Repo`)
-    * `--no-start` - do not start applications
+    * `-r`, `--repo` - the repo to generate migration for
 
   """
+
+  @switches [change: :string]
 
   @doc false
   def run(args) do
@@ -35,15 +40,18 @@ defmodule Mix.Tasks.Ecto.Gen.Migration do
     repos = parse_repo(args)
 
     Enum.each repos, fn repo ->
-      case OptionParser.parse(args) do
-        {_, [name], _} ->
+      case OptionParser.parse(args, switches: @switches) do
+        {opts, [name], _} ->
           ensure_repo(repo, args)
           path = Path.relative_to(migrations_path(repo), Mix.Project.app_path)
-          file = Path.join(path, "#{timestamp}_#{underscore(name)}.exs")
+          file = Path.join(path, "#{timestamp()}_#{underscore(name)}.exs")
           create_directory path
-          create_file file, migration_template(mod: Module.concat([repo, Migrations, camelize(name)]))
 
-          if open?(file) && Mix.shell.yes?("Do you want to run this migration?") do
+          assigns = [mod: Module.concat([repo, Migrations, camelize(name)]),
+                     change: opts[:change]]
+          create_file file, migration_template(assigns)
+
+          if open?(file) and Mix.shell.yes?("Do you want to run this migration?") do
             Mix.Task.run "ecto.migrate", [repo]
           end
         {_, _, _} ->
@@ -66,6 +74,7 @@ defmodule Mix.Tasks.Ecto.Gen.Migration do
     use Ecto.Migration
 
     def change do
+  <%= @change %>
     end
   end
   """

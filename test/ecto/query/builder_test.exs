@@ -47,9 +47,6 @@ defmodule Ecto.Query.BuilderTest do
     assert {Macro.escape(quote do fragment(title: [foo: ^0]) end), %{0 => {0, :any}}} ==
       escape(quote do fragment(title: [foo: ^0]) end, [], __ENV__)
 
-    assert {Macro.escape(quote do fragment(^0) end), %{0 => {[title: [foo: 0]], :any}}} ==
-      escape(quote do fragment(^[title: [foo: 0]]) end, [], __ENV__)
-
     assert_raise Ecto.Query.CompileError, ~r"expects the first argument to be .* got: `:invalid`", fn ->
       escape(quote do fragment(:invalid) end, [], __ENV__)
     end
@@ -80,6 +77,10 @@ defmodule Ecto.Query.BuilderTest do
 
     assert_raise Ecto.Query.CompileError, ~r"`:atom` is not a valid query expression", fn ->
       escape(quote(do: :atom), [], __ENV__)
+    end
+
+    assert_raise Ecto.Query.CompileError, ~r"short-circuit operators are not supported: `&&`", fn ->
+      escape(quote(do: true && false), [], __ENV__)
     end
 
     assert_raise Ecto.Query.CompileError, ~r"`unknown\(1, 2\)` is not a valid query expression", fn ->
@@ -155,7 +156,7 @@ defmodule Ecto.Query.BuilderTest do
     assert quoted_type({:and, [], [1, 2]}, []) == :boolean
     assert quoted_type({:or, [], [1, 2]}, []) == :boolean
     assert quoted_type({:not, [], [1]}, []) == :boolean
-    assert quoted_type({:avg, [], [1]}, []) == :any
+    assert quoted_type({:avg, [], [1]}, []) == :integer
 
     assert quoted_type({{:., [], [{:p, [], Elixir}, :title]}, [], []}, [p: 0]) == {0, :title}
     assert quoted_type({:field, [], [{:p, [], Elixir}, :title]}, [p: 0]) == {0, :title}

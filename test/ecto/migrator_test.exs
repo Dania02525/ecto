@@ -3,7 +3,10 @@ defmodule Ecto.MigratorTest do
 
   import Support.FileHelpers
   import Ecto.Migrator
+  import ExUnit.CaptureLog
+
   alias Ecto.TestRepo
+  alias Ecto.Migration.SchemaMigration
 
   defmodule Migration do
     use Ecto.Migration
@@ -68,9 +71,21 @@ defmodule Ecto.MigratorTest do
     use Ecto.Migration
   end
 
+
+  defmodule TestSchemaRepo do
+    use Ecto.Repo, otp_app: :ecto, adapter: Ecto.TestAdapter
+  end
+
+  Application.put_env(:ecto, TestSchemaRepo, [migration_source: "my_schema_migrations"])
+
   setup do
     Process.put(:migrated_versions, [1, 2, 3])
     :ok
+  end
+
+  test "custom schema migrations table is right" do
+    assert SchemaMigration.get_source(TestRepo) == "schema_migrations"
+    assert SchemaMigration.get_source(TestSchemaRepo) == "my_schema_migrations"
   end
 
   test "logs migrations" do
@@ -89,7 +104,7 @@ defmodule Ecto.MigratorTest do
 
     assert output =~ "== Running Ecto.MigratorTest.ChangeMigration.change/0 backward"
     assert output =~ "drop table posts"
-    assert output =~ "drop index if exists posts_title_index"
+    assert output =~ "drop index posts_title_index"
     assert output =~ ~r"== Migrated in \d.\ds"
 
     output = capture_log fn ->
@@ -107,7 +122,7 @@ defmodule Ecto.MigratorTest do
 
     assert output =~ "== Running Ecto.MigratorTest.ChangeMigrationPrefix.change/0 backward"
     assert output =~ "drop table foo.comments"
-    assert output =~ "drop index if exists foo.posts_title_index"
+    assert output =~ "drop index foo.posts_title_index"
     assert output =~ ~r"== Migrated in \d.\ds"
 
     output = capture_log fn ->
@@ -258,14 +273,30 @@ defmodule Ecto.MigratorTest do
     end
   end
 
+  test "migrations will give the up and down migration status" do
+    in_tmp fn path ->
+      create_migration "1_up_migration_1.exs"
+      create_migration "2_up_migration_2.exs"
+      create_migration "3_up_migration_3.exs"
+      create_migration "4_down_migration_1.exs"
+      create_migration "5_down_migration_2.exs"
+
+      expected_result = [
+        {:up, 1, "up_migration_1"},
+        {:up, 2, "up_migration_2"},
+        {:up, 3, "up_migration_3"},
+        {:down, 4, "down_migration_1"},
+        {:down, 5, "down_migration_2"}
+      ]
+
+      assert migrations(TestRepo, path) == expected_result
+    end
+  end
+
   test "migrations run inside a transaction if the adapter supports ddl transactions" do
     capture_log fn ->
       Process.put(:supports_ddl_transaction?, true)
-
       up(TestRepo, 0, ChangeMigration)
-      # One transaction comes from the SchemaMigration insert, the other one
-      # from the actual migration we're testing.
-      assert_receive {:transaction, _}
       assert_receive {:transaction, _}
     end
   end
@@ -273,13 +304,7 @@ defmodule Ecto.MigratorTest do
   test "migrations can be forced to run outside a transaction" do
     capture_log fn ->
       Process.put(:supports_ddl_transaction?, true)
-
       up(TestRepo, 0, NoTransactionMigration)
-
-      # From the SchemaMigration insert transaction.
-      assert_received {:transaction, _}
-
-      # No transaction is executed by the migration.
       refute_received {:transaction, _}
     end
   end
@@ -287,21 +312,9 @@ defmodule Ecto.MigratorTest do
   test "migrations does not run inside a transaction if the adapter does not support ddl transactions" do
     capture_log fn ->
       Process.put(:supports_ddl_transaction?, false)
-
       up(TestRepo, 0, ChangeMigration)
-      # From the SchemaMigration insert transaction.
-      assert_received {:transaction, _}
-
-      # No transaction is executed by the migration.
       refute_received {:transaction, _}
     end
-  end
-
-  defp capture_log(fun) do
-    ExUnit.CaptureIO.capture_io(:user, fn ->
-      fun.()
-      Logger.flush()
-    end) |> String.strip
   end
 
   defp create_migration(name) do

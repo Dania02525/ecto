@@ -41,7 +41,7 @@ defmodule Ecto.Type do
 
         # When loading data from the database, we are guaranteed to
         # receive an integer (as databases are strict) and we will
-        # just return it to be stored in the model struct.
+        # just return it to be stored in the schema struct.
         def load(integer) when is_integer(integer), do: {:ok, integer}
 
         # When dumping data to the database, we *expect* an integer
@@ -51,10 +51,10 @@ defmodule Ecto.Type do
         def dump(_), do: :error
       end
 
-  Now, we can use our new field above as our primary key type in models:
+  Now we can use our new field above as our primary key type in schemas:
 
       defmodule Post do
-        use Ecto.Model
+        use Ecto.Schema
 
         @primary_key {:id, Permalink, autogenerate: true}
         schema "posts" do
@@ -68,33 +68,54 @@ defmodule Ecto.Type do
   because we were keeping the underlying representation the same, the
   value stored in the struct and the database was always an integer.
 
-  Ecto types also allow developers to create completely new types as
-  long as they can be encoded by the database. `Ecto.DateTime` and
-  `Ecto.UUID` are such examples.
+  Ecto types also allow developers to dump and load new types.
+  In order for this to work, callbacks should take care of encoding your
+  custom Ecto type into its DB representation, as well as decoding it
+  from the DB back into the Ecto type. Each callback should behave
+  as follows:
+
+    * `type` should output the name of the DB type
+    * `cast` should receive any type and output your custom Ecto type
+    * `load` should receive the DB type and output your custom Ecto type
+    * `dump` should receive your custom Ecto type and output the DB type
+
+  `Ecto.DateTime` is an example of a custom type. Developers often use
+  `Ecto.DateTime` in their schemas and Ecto takes care of converting
+  between types whenever the schema information is available. Developers
+  may also implement `Ecto.DataType` for `Ecto.DateTime`, allowing
+  `Ecto.DateTime` to behave as the database `:datetime` even in the
+  absence of schema information.
   """
 
   import Kernel, except: [match?: 2]
 
-  use Behaviour
-
+  @typedoc "An Ecto type, primitive or custom."
   @type t         :: primitive | custom
+
+  @typedoc "Primitive Ecto types (handled by Ecto)."
   @type primitive :: base | composite
+
+  @typedoc "Custom types are represented by user-defined modules."
   @type custom    :: atom
 
   @typep base      :: :integer | :float | :boolean | :string | :map |
-                      :binary | :decimal | :id | :binary_id | :any
-  @typep composite :: {:array, base} | {:embed, Ecto.Embedded.t}
+                      :binary | :decimal | :id | :binary_id |
+                      :datetime | :date | :time | :any
+  @typep composite :: {:array, t} | {:map, t} | {:embed, Ecto.Embedded.t} | {:in, t}
 
-  @base      ~w(integer float boolean string binary decimal id binary_id map any)a
-  @composite ~w(array embed)a
+  @base      ~w(integer float boolean string binary decimal datetime date time id binary_id map any)a
+  @composite ~w(array map in embed)a
 
   @doc """
   Returns the underlying schema type for the custom type.
 
   For example, if you want to provide your own datetime
   structures, the type function should return `:datetime`.
+
+  Note this function is not required to return Ecto primitive
+  types, the type is only required to be known by the adapter.
   """
-  defcallback type :: t
+  @callback type :: t
 
   @doc """
   Casts the given input to the custom type.
@@ -108,7 +129,7 @@ defmodule Ecto.Type do
     2. When passing arguments to `Ecto.Query`
 
   """
-  defcallback cast(term) :: {:ok, term} | :error
+  @callback cast(term) :: {:ok, term} | :error
 
   @doc """
   Loads the given term into a custom type.
@@ -118,7 +139,7 @@ defmodule Ecto.Type do
   the `dump/1` function is able to convert the returned value back
   into an Ecto native type.
   """
-  defcallback load(term) :: {:ok, term} | :error
+  @callback load(term) :: {:ok, term} | :error
 
   @doc """
   Dumps the given term into an Ecto native type.
@@ -126,7 +147,7 @@ defmodule Ecto.Type do
   This callback is called with any term that was stored in the struct
   and it needs to validate them and convert it to an Ecto native type.
   """
-  defcallback dump(term) :: {:ok, term} | :error
+  @callback dump(term) :: {:ok, term} | :error
 
   ## Functions
 
@@ -176,7 +197,7 @@ defmodule Ecto.Type do
   def base?(atom), do: atom in @base
 
   @doc """
-  Retrieves the underlying type of a given type.
+  Retrieves the underlying schema type for the given, possibly custom, type.
 
       iex> type(:string)
       :string
@@ -188,11 +209,16 @@ defmodule Ecto.Type do
       iex> type({:array, Ecto.DateTime})
       {:array, :datetime}
 
+      iex> type({:map, Ecto.DateTime})
+      {:map, :datetime}
+
   """
   @spec type(t) :: t
   def type(type)
 
   def type({:array, type}), do: {:array, type(type)}
+
+  def type({:map, type}), do: {:map, type(type)}
 
   def type(type) do
     if primitive?(type) do
@@ -249,7 +275,7 @@ defmodule Ecto.Type do
   underlying data store.
 
       iex> dump(:string, nil)
-      {:ok, %Ecto.Query.Tagged{value: nil, type: :string}}
+      {:ok, nil}
       iex> dump(:string, "foo")
       {:ok, "foo"}
 
@@ -259,7 +285,7 @@ defmodule Ecto.Type do
       :error
 
       iex> dump(:binary, "foo")
-      {:ok, %Ecto.Query.Tagged{value: "foo", type: :binary}}
+      {:ok, "foo"}
       iex> dump(:binary, 1)
       :error
 
@@ -268,27 +294,44 @@ defmodule Ecto.Type do
       iex> dump({:array, :integer}, [1, "2", 3])
       :error
       iex> dump({:array, :binary}, ["1", "2", "3"])
-      {:ok, %Ecto.Query.Tagged{value: ["1", "2", "3"], type: {:array, :binary}}}
+      {:ok, ["1", "2", "3"]}
 
   A `dumper` function may be given for handling recursive types.
   """
   @spec dump(t, term, (t, term -> {:ok, term} | :error)) :: {:ok, term} | :error
   def dump(type, value, dumper \\ &dump/2)
 
+  def dump(_type, nil, _dumper) do
+    {:ok, nil}
+  end
+
+  def dump(:any, value, _dumper) do
+    Ecto.DataType.dump(value)
+  end
+
   def dump({:embed, embed}, value, dumper) do
     dump_embed(embed, value, dumper)
   end
 
-  def dump(type, nil, _dumper) do
-    {:ok, %Ecto.Query.Tagged{value: nil, type: type(type)}}
+  def dump({:array, type}, value, dumper) when is_list(value) do
+    array(value, &dumper.(type, &1), [])
   end
 
-  def dump({:array, type}, value, dumper) do
-    if is_list(value) do
-      dump_array(type, value, dumper, [], false)
-    else
-      :error
+  def dump({:map, type}, value, dumper) when is_map(value) do
+    map(Map.to_list(value), &dumper.(type, &1), %{})
+  end
+
+  def dump({:in, type}, value, dumper) do
+    case dump({:array, type}, value, dumper) do
+      {:ok, v} -> {:ok, {:in, v}}
+      :error -> :error
     end
+  end
+
+  def dump(:decimal, term, _dumper) when is_number(term) do
+    {:ok, Decimal.new(term)} # TODO: Add Decimal.parse/1
+  rescue
+    Decimal.Error -> :error
   end
 
   def dump(type, value, _dumper) do
@@ -296,72 +339,30 @@ defmodule Ecto.Type do
       not primitive?(type) ->
         type.dump(value)
       of_base_type?(type, value) ->
-        {:ok, tag(type, value)}
+        {:ok, value}
       true ->
         :error
     end
   end
 
-  defp tag(:binary, value),
-    do: %Ecto.Query.Tagged{type: :binary, value: value}
-  defp tag(_type, value),
-    do: value
-
-  defp dump_array(type, [h|t], dumper, acc, tagged) do
-    case dumper.(type, h) do
-      {:ok, %Ecto.Query.Tagged{value: h}} ->
-        dump_array(type, t, dumper, [h|acc], true)
-      {:ok, h} ->
-        dump_array(type, t, dumper, [h|acc], tagged)
-      :error ->
-        :error
-    end
-  end
-
-  defp dump_array(type, [], _dumper, acc, true) do
-    {:ok, %Ecto.Query.Tagged{value: Enum.reverse(acc), type: type({:array, type})}}
-  end
-
-  defp dump_array(_type, [], _dumper, acc, false) do
-    {:ok, Enum.reverse(acc)}
-  end
-
-  defp dump_embed(%{cardinality: :one} = embed, nil, _fun) do
-    {:ok, %Ecto.Query.Tagged{value: nil, type: type({:embed, embed})}}
-  end
-
-  defp dump_embed(%{cardinality: :one, related: model, field: field} = embed,
+  defp dump_embed(%{cardinality: :one, related: schema, field: field},
                   value, fun) when is_map(value) do
-    assert_replace_strategy!(embed)
-    {:ok, dump_embed(field, model, value, model.__schema__(:types), fun)}
+    {:ok, dump_embed(field, schema, value, schema.__schema__(:types), fun)}
   end
 
-  defp dump_embed(%{cardinality: :many, related: model, field: field} = embed,
+  defp dump_embed(%{cardinality: :many, related: schema, field: field},
                   value, fun) when is_list(value) do
-    assert_replace_strategy!(embed)
-    types = model.__schema__(:types)
-    {:ok, for(changeset <- value,
-              model = dump_embed(field, model, changeset, types, fun),
-              do: model)}
+    types = schema.__schema__(:types)
+    {:ok, Enum.map(value, &dump_embed(field, schema, &1, types, fun))}
   end
 
   defp dump_embed(_embed, _value, _fun) do
     :error
   end
 
-  defp dump_embed(_field, _model, %Ecto.Changeset{action: :delete}, _types, _fun) do
-    nil
-  end
-
-  defp dump_embed(_field, model, %Ecto.Changeset{model: %{__struct__: model}} = changeset, types, dumper) do
-    %{model: struct, changes: changes} = changeset
-
+  defp dump_embed(_field, schema, %{__struct__: schema} = struct, types, dumper) do
     Enum.reduce(types, %{}, fn {field, type}, acc ->
-      value =
-        case Map.fetch(changes, field) do
-          {:ok, change} -> change
-          :error        -> Map.get(struct, field)
-        end
+      value = Map.get(struct, field)
 
       case dumper.(type, value) do
         {:ok, value} -> Map.put(acc, field, value)
@@ -370,7 +371,7 @@ defmodule Ecto.Type do
     end)
   end
 
-  defp dump_embed(field, _model, value, _types, _fun) do
+  defp dump_embed(field, _schema, value, _types, _fun) do
     raise ArgumentError, "cannot dump embed `#{field}`, invalid value: #{inspect value}"
   end
 
@@ -398,12 +399,12 @@ defmodule Ecto.Type do
 
   def load(_type, nil, _loader), do: {:ok, nil}
 
-  def load({:array, type}, value, loader) do
-    if is_list(value) do
-      array(value, &loader.(type, &1), [])
-    else
-      :error
-    end
+  def load({:array, type}, value, loader) when is_list(value) do
+    array(value, &loader.(type, &1), [])
+  end
+
+  def load({:map, type}, value, loader) when is_map(value) do
+    map(Map.to_list(value), &loader.(type, &1), %{})
   end
 
   def load(type, value, _loader) do
@@ -419,29 +420,27 @@ defmodule Ecto.Type do
 
   defp load_embed(%{cardinality: :one}, nil, _fun), do: {:ok, nil}
 
-  defp load_embed(%{cardinality: :one, related: model, field: field} = embed,
+  defp load_embed(%{cardinality: :one, related: schema, field: field},
                   value, fun) when is_map(value) do
-    assert_replace_strategy!(embed)
-    {:ok, load_embed(field, model, value, fun)}
+    {:ok, load_embed(field, schema, value, fun)}
   end
 
   defp load_embed(%{cardinality: :many}, nil, _fun), do: {:ok, []}
 
-  defp load_embed(%{cardinality: :many, related: model, field: field} = embed,
+  defp load_embed(%{cardinality: :many, related: schema, field: field},
                   value, fun) when is_list(value) do
-    assert_replace_strategy!(embed)
-    {:ok, Enum.map(value, &load_embed(field, model, &1, fun))}
+    {:ok, Enum.map(value, &load_embed(field, schema, &1, fun))}
   end
 
   defp load_embed(_embed, _value, _fun) do
     :error
   end
 
-  defp load_embed(_field, model, value, loader) when is_map(value) do
-    Ecto.Schema.__load__(model, nil, nil, nil, value, loader)
+  defp load_embed(_field, schema, value, loader) when is_map(value) do
+    Ecto.Schema.__load__(schema, nil, nil, nil, value, loader)
   end
 
-  defp load_embed(field, _model, value, _fun) do
+  defp load_embed(field, _schema, value, _fun) do
     raise ArgumentError, "cannot load embed `#{field}`, invalid value: #{inspect value}"
   end
 
@@ -452,8 +451,7 @@ defmodule Ecto.Type do
   to cast outside values to specific types.
 
   Note that nil can be cast to all primitive types as data
-  stores allow nil to be set on any column. Custom data types
-  may want to handle nil specially though.
+  stores allow nil to be set on any column.
 
       iex> cast(:any, "whatever")
       {:ok, "whatever"}
@@ -520,26 +518,22 @@ defmodule Ecto.Type do
 
   """
   @spec cast(t, term) :: {:ok, term} | :error
-  def cast({:embed, _}, _) do
-    :error
+  def cast({:embed, type}, value) do
+    cast_embed(type, value)
   end
 
   def cast(_type, nil), do: {:ok, nil}
 
-  def cast({:array, type}, term) do
-    if is_list(term) do
-      array(term, &cast(type, &1), [])
-    else
-      :error
-    end
+  def cast({:array, type}, term) when is_list(term) do
+    array(term, &cast(type, &1), [])
   end
 
-  def cast(:binary_id, term) do
-    if is_binary(term) do
-      {:ok, term}
-    else
-      :error
-    end
+  def cast({:map, type}, term) when is_map(term) do
+    map(Map.to_list(term), &cast(type, &1), %{})
+  end
+
+  def cast({:in, type}, term) when is_list(term) do
+    array(term, &cast(type, &1), [])
   end
 
   def cast(:float, term) when is_binary(term) do
@@ -566,7 +560,14 @@ defmodule Ecto.Type do
     end
   end
 
-  def cast(type, value) do
+  def cast(type, term) do
+    case try_cast(type, term) do
+      {:ok, _} = ok -> ok
+      :error -> Ecto.DataType.cast(term, type)
+    end
+  end
+
+  defp try_cast(type, value) do
     cond do
       not primitive?(type) ->
         type.cast(value)
@@ -577,25 +578,96 @@ defmodule Ecto.Type do
     end
   end
 
+  defp cast_embed(%{cardinality: :one}, nil), do: {:ok, nil}
+  defp cast_embed(%{cardinality: :one, related: schema}, %{__struct__: schema} = struct) do
+    {:ok, struct}
+  end
+
+  defp cast_embed(%{cardinality: :many}, nil), do: {:ok, []}
+  defp cast_embed(%{cardinality: :many, related: schema}, value) when is_list(value) do
+    if Enum.all?(value, &Kernel.match?(%{__struct__: ^schema}, &1)) do
+      {:ok, value}
+    else
+      :error
+    end
+  end
+
+  defp cast_embed(_embed, _value) do
+    :error
+  end
+
+  ## Adapter related
+
+  @doc false
+  def adapter_load(_adapter, type, nil),
+    do: load(type, nil)
+  def adapter_load(adapter, type, value),
+    do: do_adapter_load(adapter.loaders(type(type), type), {:ok, value}, adapter)
+
+  defp do_adapter_load(_, :error, _adapter),
+    do: :error
+  defp do_adapter_load([fun|t], {:ok, value}, adapter) when is_function(fun),
+    do: do_adapter_load(t, fun.(value), adapter)
+  defp do_adapter_load([type|t], {:ok, _} = acc, adapter) when type in @base,
+    do: do_adapter_load(t, acc, adapter)
+  defp do_adapter_load([type|t], {:ok, value}, adapter),
+    do: do_adapter_load(t, load(type, value, &adapter_load(adapter, &1, &2)), adapter)
+  defp do_adapter_load([], {:ok, _} = acc, _adapter),
+    do: acc
+
+  @doc false
+  def adapter_dump(_adapter, type, nil),
+    do: dump(type, nil)
+  def adapter_dump(adapter, type, value),
+    do: do_adapter_dump(adapter.dumpers(type(type), type), {:ok, value}, adapter)
+
+  defp do_adapter_dump(_, :error, _adapter),
+    do: :error
+  defp do_adapter_dump([fun|t], {:ok, value}, adapter) when is_function(fun),
+    do: do_adapter_dump(t, fun.(value), adapter)
+  defp do_adapter_dump([type|t], {:ok, value}, adapter),
+    do: do_adapter_dump(t, dump(type, value, &adapter_dump(adapter, &1, &2)), adapter)
+  defp do_adapter_dump([], {:ok, _} = acc, _adapter),
+    do: acc
+
   ## Helpers
 
   # Checks if a value is of the given primitive type.
-  defp of_base_type?(:any, _),        do: true
-  defp of_base_type?(:id, term),      do: is_integer(term)
-  defp of_base_type?(:float, term),   do: is_float(term)
-  defp of_base_type?(:integer, term), do: is_integer(term)
-  defp of_base_type?(:boolean, term), do: is_boolean(term)
+  defp of_base_type?(:any, _),           do: true
+  defp of_base_type?({:array, _}, _),    do: false # Always handled explicitly.
+  defp of_base_type?(:id, term),         do: is_integer(term)
+  defp of_base_type?(:float, term),      do: is_float(term)
+  defp of_base_type?(:integer, term),    do: is_integer(term)
+  defp of_base_type?(:boolean, term),    do: is_boolean(term)
+  defp of_base_type?(:binary_id, value), do: is_binary(value)
+  defp of_base_type?(:binary, term),     do: is_binary(term)
+  defp of_base_type?(:string, term),     do: is_binary(term)
+  defp of_base_type?(:map, term),        do: is_map(term) and not Map.has_key?(term, :__struct__)
+  defp of_base_type?({:map, _}, _),      do: false # Always handled explicitly.
+  defp of_base_type?(:decimal, value),   do: Kernel.match?(%{__struct__: Decimal}, value)
 
-  defp of_base_type?(:binary, term), do: is_binary(term)
-  defp of_base_type?(:string, term), do: is_binary(term)
-  defp of_base_type?(:map, term),    do: is_map(term) and not Map.has_key?(term, :__struct__)
-
-  defp of_base_type?(:decimal, %Decimal{}), do: true
-  defp of_base_type?(:binary_id, value) do
-    raise "cannot dump/load :binary_id type directly, attempted value: #{inspect value}"
+  defp of_base_type?(:date, value) do
+    case value do
+      {_, _, _} -> true
+      _ -> false
+    end
   end
 
-  defp of_base_type?(struct, _) when struct in ~w(decimal date time datetime)a, do: false
+  defp of_base_type?(:time, value) do
+    case value do
+      {_, _, _, _} -> true
+      {_, _, _} -> true
+      _ -> false
+    end
+  end
+
+  defp of_base_type?(:datetime, value) do
+    case value do
+      {{_, _, _}, {_, _, _, _}} -> true
+      {{_, _, _}, {_, _, _}} -> true
+      _ -> false
+    end
+  end
 
   defp array([h|t], fun, acc) do
     case fun.(h) do
@@ -608,9 +680,16 @@ defmodule Ecto.Type do
     {:ok, Enum.reverse(acc)}
   end
 
-  defp assert_replace_strategy!(%{strategy: :replace}), do: :ok
-  defp assert_replace_strategy!(%{strategy: strategy, field: field}) do
-    raise ArgumentError, "could not load/dump embed `#{field}` because the current adapter " <>
-                         "does not support strategy `#{strategy}`"
+  defp map([{key, value} | t], fun, acc) do
+    case fun.(value) do
+      {:ok, value} -> map(t, fun, Map.put(acc, key, value))
+      :error -> :error
+    end
   end
+
+  defp map([], _fun, acc) do
+    {:ok, acc}
+  end
+
+  defp map(_, _, _), do: :error
 end

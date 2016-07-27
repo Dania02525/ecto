@@ -4,11 +4,11 @@ defmodule Mix.Tasks.Ecto.Gen.MigrationTest do
   import Support.FileHelpers
   import Mix.Tasks.Ecto.Gen.Migration, only: [run: 1]
 
-  tmp_path = Path.join(tmp_path, inspect(Ecto.Gen.Migration))
+  tmp_path = Path.join(tmp_path(), inspect(Ecto.Gen.Migration))
   @migrations_path Path.join(tmp_path, "migrations")
 
   defmodule Repo do
-    def __repo__ do
+    def __adapter__ do
       true
     end
 

@@ -1,18 +1,17 @@
-defmodule Ecto.Migration.Manager.Supervisor do
-  @doc """
-  Starts the migration manager as a supervised process
-  """
+defmodule Ecto.Migration.Supervisor do
+  @moduledoc false
+
   use Supervisor
 
   def start_link do
-    Supervisor.start_link(__MODULE__, :ok)
+    Supervisor.start_link(__MODULE__, :ok, name: __MODULE__)
   end
 
   def init(:ok) do
     children = [
-      worker(Ecto.Migration.Manager, [])
+      worker(Ecto.Migration.Runner, [], restart: :temporary)
     ]
 
-    supervise(children, strategy: :one_for_one)
+    supervise(children, strategy: :simple_one_for_one)
   end
 end

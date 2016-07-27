@@ -1,15 +1,14 @@
-if Code.ensure_loaded?(Postgrex.Connection) do
+if Code.ensure_loaded?(Postgrex) do
 
   defmodule Ecto.Adapters.Postgres.Connection do
     @moduledoc false
 
     @default_port 5432
-    @behaviour Ecto.Adapters.Connection
-    @behaviour Ecto.Adapters.SQL.Query
+    @behaviour Ecto.Adapters.SQL.Connection
 
-    ## Connection
+    ## Module and Options
 
-    def connect(opts) do
+    def child_spec(opts) do
       json = Application.get_env(:ecto, :json_library)
       extensions = [{Ecto.Adapters.Postgres.DateTime, []},
                     {Postgrex.Extensions.JSON, library: json}]
@@ -18,22 +17,12 @@ if Code.ensure_loaded?(Postgrex.Connection) do
         opts
         |> Keyword.update(:extensions, extensions, &(&1 ++ extensions))
         |> Keyword.update(:port, @default_port, &normalize_port/1)
+        |> Keyword.put(:types, true)
 
-      Postgrex.Connection.start_link(opts)
+      Postgrex.child_spec(opts)
     end
 
-    def query(conn, sql, params, opts) do
-      params = Enum.map params, fn
-        %Ecto.Query.Tagged{value: value} -> value
-        value -> value
-      end
-
-      case Postgrex.Connection.query(conn, sql, params, opts) do
-        {:ok, res}        -> {:ok, Map.from_struct(res)}
-        {:error, _} = err -> err
-      end
-    end
-
+    # TODO: Remove this on 2.1 (normalization should happen on the adapter)
     defp normalize_port(port) when is_binary(port), do: String.to_integer(port)
     defp normalize_port(port) when is_integer(port), do: port
 
@@ -41,6 +30,10 @@ if Code.ensure_loaded?(Postgrex.Connection) do
       do: [unique: constraint]
     def to_constraints(%Postgrex.Error{postgres: %{code: :foreign_key_violation, constraint: constraint}}),
       do: [foreign_key: constraint]
+    def to_constraints(%Postgrex.Error{postgres: %{code: :exclusion_violation, constraint: constraint}}),
+      do: [exclude: constraint]
+    def to_constraints(%Postgrex.Error{postgres: %{code: :check_violation, constraint: constraint}}),
+      do: [check: constraint]
 
     # Postgres 9.2 and earlier does not provide the constraint field
     def to_constraints(%Postgrex.Error{postgres: %{code: :unique_violation, message: message}}) do
@@ -55,6 +48,18 @@ if Code.ensure_loaded?(Postgrex.Connection) do
         _ -> []
       end
     end
+    def to_constraints(%Postgrex.Error{postgres: %{code: :exclusion_violation, message: message}}) do
+      case :binary.split(message, " exclude constraint ") do
+        [_, quoted] -> [exclude: strip_quotes(quoted)]
+        _ -> []
+      end
+    end
+    def to_constraints(%Postgrex.Error{postgres: %{code: :check_violation, message: message}}) do
+      case :binary.split(message, " check constraint ") do
+        [_, quoted] -> [check: strip_quotes(quoted)]
+        _ -> []
+      end
+    end
 
     def to_constraints(%Postgrex.Error{}),
       do: []
@@ -65,32 +70,26 @@ if Code.ensure_loaded?(Postgrex.Connection) do
       unquoted
     end
 
-    ## Transaction
-
-    def begin_transaction do
-      "BEGIN"
-    end
-
-    def rollback do
-      "ROLLBACK"
-    end
-
-    def commit do
-      "COMMIT"
-    end
-
-    def savepoint(savepoint) do
-      "SAVEPOINT " <> savepoint
-    end
-
-    def rollback_to_savepoint(savepoint) do
-      "ROLLBACK TO SAVEPOINT " <> savepoint
-    end
-
     ## Query
 
+    def prepare_execute(conn, name, sql, params, opts) do
+      query = %Postgrex.Query{name: name, statement: sql}
+      DBConnection.prepare_execute(conn, query, params, opts)
+    end
+
+    def execute(conn, sql, params, opts) when is_binary(sql) do
+      query = %Postgrex.Query{name: "", statement: sql}
+      case DBConnection.prepare_execute(conn, query, params, opts) do
+        {:ok, _, query} -> {:ok, query}
+        {:error, _} = err -> err
+      end
+    end
+
+    def execute(conn, %{} = query, params, opts) do
+      DBConnection.execute(conn, query, params, opts)
+    end
+
     alias Ecto.Query
-    alias Ecto.Query.SelectExpr
     alias Ecto.Query.QueryExpr
     alias Ecto.Query.JoinExpr
 
@@ -98,7 +97,7 @@ if Code.ensure_loaded?(Postgrex.Connection) do
       sources        = create_names(query)
       distinct_exprs = distinct_exprs(query, sources)
 
-      from     = from(sources)
+      from     = from(query, sources)
       select   = select(query, distinct_exprs, sources)
       join     = join(query, sources)
       where    = where(query, sources)
@@ -112,38 +111,53 @@ if Code.ensure_loaded?(Postgrex.Connection) do
       assemble([select, from, join, where, group_by, having, order_by, limit, offset, lock])
     end
 
-    def update_all(query) do
+    def update_all(%{from: from} = query) do
       sources = create_names(query)
+      {from, name} = get_source(query, sources, 0, from)
 
       fields = update_fields(query, sources)
-      update = update_expr(query, elem(sources, 0))
-      join   = update_filter(query, sources)
-      where  = where(query, sources)
+      {join, wheres} = using_join(query, :update_all, "FROM", sources)
+      where = where(%{query | wheres: wheres ++ query.wheres}, sources)
 
-      assemble([update, "SET", fields, join, where])
+      assemble(["UPDATE #{from} AS #{name} SET", fields, join, where, returning(query, sources)])
     end
 
-    def delete_all(query) do
+    def delete_all(%{from: from} = query) do
       sources = create_names(query)
-      {table, name, _model} = elem(sources, 0)
+      {from, name} = get_source(query, sources, 0, from)
 
-      join  = using(query, sources)
-      where = delete_all_where(query.joins, query, sources)
+      {join, wheres} = using_join(query, :delete_all, "USING", sources)
+      where = where(%{query | wheres: wheres ++ query.wheres}, sources)
 
-      assemble(["DELETE FROM #{table} AS #{name}", join, where])
+      assemble(["DELETE FROM #{from} AS #{name}", join, where, returning(query, sources)])
     end
 
-    def insert(prefix, table, fields, returning) do
+    def insert(prefix, table, header, rows, returning) do
       values =
-        if fields == [] do
-          "DEFAULT VALUES"
+        if header == [] do
+          "VALUES " <> Enum.map_join(rows, ",", fn _ -> "(DEFAULT)" end)
         else
-          "(" <> Enum.map_join(fields, ", ", &quote_name/1) <> ") " <>
-          "VALUES (" <> Enum.map_join(1..length(fields), ", ", &"$#{&1}") <> ")"
+          "(" <> Enum.map_join(header, ",", &quote_name/1) <> ") " <>
+          "VALUES " <> insert_all(rows, 1, "")
         end
 
-      "INSERT INTO #{quote_table(prefix, table)} " <> values <> returning(returning)
+      assemble(["INSERT INTO #{quote_table(prefix, table)}", values, returning(returning)])
     end
+
+    defp insert_all([row|rows], counter, acc) do
+      {counter, row} = insert_each(row, counter, "")
+      insert_all(rows, counter, acc <> ",(" <> row <> ")")
+    end
+    defp insert_all([], _counter, "," <> acc) do
+      acc
+    end
+
+    defp insert_each([nil|t], counter, acc),
+      do: insert_each(t, counter, acc <> ",DEFAULT")
+    defp insert_each([_|t], counter, acc),
+      do: insert_each(t, counter + 1, acc <> ",$" <> Integer.to_string(counter))
+    defp insert_each([], counter, "," <> acc),
+      do: {counter, acc}
 
     def update(prefix, table, fields, filters, returning) do
       {fields, count} = Enum.map_reduce fields, 1, fn field, acc ->
@@ -154,9 +168,9 @@ if Code.ensure_loaded?(Postgrex.Connection) do
         {"#{quote_name(field)} = $#{acc}", acc + 1}
       end
 
-      "UPDATE #{quote_table(prefix, table)} SET " <> Enum.join(fields, ", ") <>
-        " WHERE " <> Enum.join(filters, " AND ") <>
-        returning(returning)
+      assemble(["UPDATE #{quote_table(prefix, table)} SET " <> Enum.join(fields, ", "),
+                "WHERE " <> Enum.join(filters, " AND "),
+                returning(returning)])
     end
 
     def delete(prefix, table, filters, returning) do
@@ -164,16 +178,15 @@ if Code.ensure_loaded?(Postgrex.Connection) do
         {"#{quote_name(field)} = $#{acc}", acc + 1}
       end
 
-      "DELETE FROM #{quote_table(prefix, table)} WHERE " <>
-        Enum.join(filters, " AND ") <> returning(returning)
+      assemble(["DELETE FROM #{quote_table(prefix, table)} WHERE " <> Enum.join(filters, " AND "),
+                returning(returning)])
     end
 
     ## Query generation
 
     binary_ops =
       [==: "=", !=: "!=", <=: "<=", >=: ">=", <:  "<", >:  ">",
-       and: "AND", or: "OR",
-       ilike: "ILIKE", like: "LIKE"]
+       and: "AND", or: "OR", ilike: "ILIKE", like: "LIKE"]
 
     @binary_ops Keyword.keys(binary_ops)
 
@@ -183,12 +196,17 @@ if Code.ensure_loaded?(Postgrex.Connection) do
 
     defp handle_call(fun, _arity), do: {:fun, Atom.to_string(fun)}
 
-    defp select(%Query{select: %SelectExpr{fields: fields}, distinct: distinct} = query,
+    defp select(%Query{select: %{fields: fields}, distinct: distinct} = query,
                 distinct_exprs, sources) do
       "SELECT " <>
         distinct(distinct, distinct_exprs) <>
-        Enum.map_join(fields, ", ", &expr(&1, sources, query))
+        select_fields(fields, sources, query)
     end
+
+    defp select_fields([], _sources, _query),
+      do: "TRUE"
+    defp select_fields(fields, sources, query),
+      do: Enum.map_join(fields, ", ", &expr(&1, sources, query))
 
     defp distinct_exprs(%Query{distinct: %QueryExpr{expr: exprs}} = query, sources)
         when is_list(exprs) do
@@ -201,19 +219,9 @@ if Code.ensure_loaded?(Postgrex.Connection) do
     defp distinct(%QueryExpr{expr: false}, _exprs), do: ""
     defp distinct(_query, exprs), do: "DISTINCT ON (" <> exprs <> ") "
 
-    defp from(sources) do
-      {table, name, _model} = elem(sources, 0)
-      "FROM #{table} AS #{name}"
-    end
-
-    defp using(%Query{joins: []}, _sources), do: []
-    defp using(%Query{joins: joins} = query, sources) do
-      Enum.map_join(joins, " ", fn
-        %JoinExpr{on: %QueryExpr{expr: expr}, ix: ix} ->
-          {table, name, _model} = elem(sources, ix)
-          where = expr(expr, sources, query)
-          "USING #{table} AS #{name} WHERE " <> where
-      end)
+    defp from(%{from: from} = query, sources) do
+      {from, name} = get_source(query, sources, 0, from)
+      "FROM #{from} AS #{name}"
     end
 
     defp update_fields(%Query{updates: updates} = query, sources) do
@@ -246,38 +254,41 @@ if Code.ensure_loaded?(Postgrex.Connection) do
       error!(query, "Unknown update operation #{inspect command} for PostgreSQL")
     end
 
-    defp update_expr(%Query{joins: []}, {table, name, _model}) do
-      "UPDATE #{table} AS #{name}"
-    end
-    defp update_expr(_query, {table, _name, _model}) do
-      "UPDATE #{table}"
-    end
+    defp using_join(%Query{joins: []}, _kind, _prefix, _sources), do: {[], []}
+    defp using_join(%Query{joins: joins} = query, kind, prefix, sources) do
+      froms =
+        Enum.map_join(joins, ", ", fn
+          %JoinExpr{qual: :inner, ix: ix, source: source} ->
+            {join, name} = get_source(query, sources, ix, source)
+            join <> " AS " <> name
+          %JoinExpr{qual: qual} ->
+            error!(query, "PostgreSQL supports only inner joins on #{kind}, got: `#{qual}`")
+        end)
 
-    defp update_filter(%Query{joins: []}, _sources), do: []
-    defp update_filter(query, sources) do
-      from(sources) <> " "  <> join(query, sources)
+      wheres =
+        for %JoinExpr{on: %QueryExpr{expr: value} = expr} <- joins,
+            value != true,
+            do: expr
+
+      {prefix <> " " <> froms, wheres}
     end
 
     defp join(%Query{joins: []}, _sources), do: []
     defp join(%Query{joins: joins} = query, sources) do
       Enum.map_join(joins, " ", fn
         %JoinExpr{on: %QueryExpr{expr: expr}, qual: qual, ix: ix, source: source} ->
-          {join, name, _model} = elem(sources, ix)
+          {join, name} = get_source(query, sources, ix, source)
           qual = join_qual(qual)
-          join = join || "(" <> expr(source, sources, query) <> ")"
-          "#{qual} JOIN " <> join <> " AS #{name} ON " <> expr(expr, sources, query)
+          qual <> " " <> join <> " AS " <> name <> " ON " <> expr(expr, sources, query)
       end)
     end
 
-    defp join_qual(:inner), do: "INNER"
-    defp join_qual(:left),  do: "LEFT OUTER"
-    defp join_qual(:right), do: "RIGHT OUTER"
-    defp join_qual(:full),  do: "FULL OUTER"
-
-    defp delete_all_where([], query, sources), do: where(query, sources)
-    defp delete_all_where(_joins, %Query{wheres: wheres} = query, sources) do
-      boolean("AND", wheres, sources, query)
-    end
+    defp join_qual(:inner), do: "INNER JOIN"
+    defp join_qual(:inner_lateral), do: "INNER JOIN LATERAL"
+    defp join_qual(:left),  do: "LEFT OUTER JOIN"
+    defp join_qual(:left_lateral),  do: "LEFT OUTER JOIN LATERAL"
+    defp join_qual(:right), do: "RIGHT OUTER JOIN"
+    defp join_qual(:full),  do: "FULL OUTER JOIN"
 
     defp where(%Query{wheres: wheres} = query, sources) do
       boolean("WHERE", wheres, sources, query)
@@ -356,15 +367,14 @@ if Code.ensure_loaded?(Postgrex.Connection) do
       "#{name}.#{quote_name(field)}"
     end
 
-    defp expr({:&, _, [idx]}, sources, query) do
-      {table, name, model} = elem(sources, idx)
-      unless model do
-        error!(query, "PostgreSQL requires a model when using selector " <>
-          "#{inspect name} but only the table #{inspect table} was given. " <>
-          "Please specify a model or specify exactly which fields from " <>
+    defp expr({:&, _, [idx, fields, _counter]}, sources, query) do
+      {_, name, schema} = elem(sources, idx)
+      if is_nil(schema) and is_nil(fields) do
+        error!(query, "PostgreSQL requires a schema module when using selector " <>
+          "#{inspect name} but none was given. " <>
+          "Please specify a schema or specify exactly which fields from " <>
           "#{inspect name} you desire")
       end
-      fields = model.__schema__(:fields)
       Enum.map_join(fields, ", ", &"#{name}.#{quote_name(&1)}")
     end
 
@@ -377,9 +387,8 @@ if Code.ensure_loaded?(Postgrex.Connection) do
       expr(left, sources, query) <> " IN (" <> args <> ")"
     end
 
-    defp expr({:in, _, [left, {:^, _, [ix, length]}]}, sources, query) do
-      args = Enum.map_join ix+1..ix+length, ",", &"$#{&1}"
-      expr(left, sources, query) <> " IN (" <> args <> ")"
+    defp expr({:in, _, [left, {:^, _, [ix, _]}]}, sources, query) do
+      expr(left, sources, query) <> " = ANY($#{ix+1})"
     end
 
     defp expr({:in, _, [left, right]}, sources, query) do
@@ -392,6 +401,10 @@ if Code.ensure_loaded?(Postgrex.Connection) do
 
     defp expr({:not, _, [expr]}, sources, query) do
       "NOT (" <> expr(expr, sources, query) <> ")"
+    end
+
+    defp expr(%Ecto.SubQuery{query: query}, _sources, _query) do
+      all(query)
     end
 
     defp expr({:fragment, _, [kw]}, _sources, query) when is_list(kw) or tuple_size(kw) == 3 do
@@ -490,10 +503,15 @@ if Code.ensure_loaded?(Postgrex.Connection) do
       expr(expr, sources, query)
     end
 
+    defp returning(%Query{select: nil}, _sources),
+      do: []
+    defp returning(%Query{select: %{fields: fields}} = query, sources),
+      do: "RETURNING " <> select_fields(fields, sources, query)
+
     defp returning([]),
-      do: ""
+      do: []
     defp returning(returning),
-      do: " RETURNING " <> Enum.map_join(returning, ", ", &quote_name/1)
+      do: "RETURNING " <> Enum.map_join(returning, ", ", &quote_name/1)
 
     defp create_names(%{prefix: prefix, sources: sources}) do
       create_names(prefix, sources, 0, tuple_size(sources)) |> List.to_tuple()
@@ -502,11 +520,13 @@ if Code.ensure_loaded?(Postgrex.Connection) do
     defp create_names(prefix, sources, pos, limit) when pos < limit do
       current =
         case elem(sources, pos) do
-          {table, model} ->
+          {table, schema} ->
             name = String.first(table) <> Integer.to_string(pos)
-            {quote_table(prefix, table), name, model}
+            {quote_table(prefix, table), name, schema}
           {:fragment, _, _} ->
             {nil, "f" <> Integer.to_string(pos), nil}
+          %Ecto.SubQuery{} ->
+            {nil, "s" <> Integer.to_string(pos), nil}
         end
       [current|create_names(prefix, sources, pos + 1, limit)]
     end
@@ -517,18 +537,22 @@ if Code.ensure_loaded?(Postgrex.Connection) do
 
     # DDL
 
-    alias Ecto.Migration.Table
-    alias Ecto.Migration.Index
-    alias Ecto.Migration.Reference
+    alias Ecto.Migration.{Table, Index, Reference, Constraint}
 
     @drops [:drop, :drop_if_exists]
 
     def execute_ddl({command, %Table{}=table, columns}) when command in [:create, :create_if_not_exists] do
       options       = options_expr(table.options)
       if_not_exists = if command == :create_if_not_exists, do: " IF NOT EXISTS", else: ""
+      pk_definition = case pk_definition(columns) do
+        nil -> ""
+        pk -> ", #{pk}"
+      end
 
       "CREATE TABLE" <> if_not_exists <>
-        " #{quote_table(table.prefix, table.name)} (#{column_definitions(table, columns)})" <> options
+        " #{quote_table(table.prefix, table.name)}" <>
+        " (#{column_definitions(table, columns)}#{pk_definition})" <> options <>
+        comment_on(:table, table.name, table.comment) <> comments_for_columns(table, columns)
     end
 
     def execute_ddl({command, %Table{}=table}) when command in @drops do
@@ -538,7 +562,13 @@ if Code.ensure_loaded?(Postgrex.Connection) do
     end
 
     def execute_ddl({:alter, %Table{}=table, changes}) do
-      "ALTER TABLE #{quote_table(table.prefix, table.name)} #{column_changes(table, changes)}"
+      pk_definition = case pk_definition(changes) do
+        nil -> ""
+        pk -> ", ADD #{pk}"
+      end
+      "ALTER TABLE #{quote_table(table.prefix, table.name)} #{column_changes(table, changes)}" <>
+      "#{pk_definition}" <> comment_on(:table, table.name, table.comment) <>
+      comments_for_columns(table, changes)
     end
 
     def execute_ddl({:create, %Index{}=index}) do
@@ -552,7 +582,9 @@ if Code.ensure_loaded?(Postgrex.Connection) do
                 "ON",
                 quote_table(index.prefix, index.table),
                 if_do(index.using, "USING #{index.using}"),
-                "(#{fields})"])
+                "(#{fields})",
+                if_do(index.where, "WHERE #{index.where}"),
+                if_do(index.comment, comment_on(:index, index.name, index.comment))])
     end
 
     def execute_ddl({:create_if_not_exists, %Index{}=index}) do
@@ -580,10 +612,57 @@ if Code.ensure_loaded?(Postgrex.Connection) do
       "ALTER TABLE #{quote_table(table.prefix, table.name)} RENAME #{quote_name(current_column)} TO #{quote_name(new_column)}"
     end
 
+    def execute_ddl({:create, %Constraint{}=constraint}) do
+      "ALTER TABLE #{quote_table(constraint.prefix, constraint.table)} ADD #{new_constraint_expr(constraint)}" <>
+      comment_on(:constraint, constraint.name, constraint.comment)
+    end
+
+    def execute_ddl({:drop, %Constraint{}=constraint}) do
+      "ALTER TABLE #{quote_table(constraint.prefix, constraint.table)} DROP CONSTRAINT #{quote_name(constraint.name)}"
+    end
+
     def execute_ddl(string) when is_binary(string), do: string
 
     def execute_ddl(keyword) when is_list(keyword),
       do: error!(nil, "PostgreSQL adapter does not support keyword lists in execute")
+
+    defp pk_definition(columns) do
+      pks =
+        for {_, name, _, opts} <- columns,
+            opts[:primary_key],
+            do: name
+
+      case pks do
+        [] -> nil
+        _  -> "PRIMARY KEY (" <> Enum.map_join(pks, ", ", &quote_name/1) <> ")"
+      end
+    end
+
+    defp comment_on(_database_object, _name, nil), do:  ""
+    defp comment_on(:column, {table_name, column_name}, comment) do
+      column_name = quote_table(table_name, column_name)
+      "; COMMENT ON COLUMN #{column_name} IS #{single_quote(comment)}"
+    end
+
+    defp comment_on(:table, name, comment) do
+      "; COMMENT ON TABLE #{quote_name(name)} IS #{single_quote(comment)}"
+    end
+
+    defp comment_on(:constraint, name, comment) do
+      "; COMMENT ON CONSTRAINT #{quote_name(name)} IS #{single_quote(comment)}"
+    end
+
+    defp comment_on(:index, name, comment) do
+      "; COMMENT ON INDEX #{quote_name(name)} IS #{single_quote(comment)}"
+    end
+
+    defp comments_for_columns(table, columns) do
+      Enum.map_join(columns, "", fn
+        {_operation, column_name, _column_type, opts} ->
+          comment_on(:column, {table.name, column_name}, opts[:comment])
+        _ -> ""
+      end)
+    end
 
     defp column_definitions(table, columns) do
       Enum.map_join(columns, ", ", &column_definition(table, &1))
@@ -647,17 +726,19 @@ if Code.ensure_loaded?(Postgrex.Connection) do
     defp column_options(type, opts) do
       default = Keyword.fetch(opts, :default)
       null    = Keyword.get(opts, :null)
-      pk      = Keyword.get(opts, :primary_key)
-
-      [default_expr(default, type), null_expr(null), pk_expr(pk)]
+      [default_expr(default, type), null_expr(null)]
     end
-
-    defp pk_expr(true), do: "PRIMARY KEY"
-    defp pk_expr(_), do: []
 
     defp null_expr(false), do: "NOT NULL"
     defp null_expr(true), do: "NULL"
     defp null_expr(_), do: []
+
+    defp new_constraint_expr(%Constraint{check: check} = constraint) when is_binary(check) do
+      "CONSTRAINT #{quote_name(constraint.name)} CHECK (#{check})"
+    end
+    defp new_constraint_expr(%Constraint{exclude: exclude} = constraint) when is_binary(exclude) do
+      "CONSTRAINT #{quote_name(constraint.name)} EXCLUDE USING #{exclude}"
+    end
 
     defp default_expr({:ok, nil}, _type),
       do: "DEFAULT NULL"
@@ -706,13 +787,13 @@ if Code.ensure_loaded?(Postgrex.Connection) do
     defp reference_expr(%Reference{} = ref, table, name),
       do: "CONSTRAINT #{reference_name(ref, table, name)} REFERENCES " <>
           "#{quote_table(table.prefix, ref.table)}(#{quote_name(ref.column)})" <>
-          reference_on_delete(ref.on_delete)
+          reference_on_delete(ref.on_delete) <> reference_on_update(ref.on_update)
 
     defp constraint_expr(%Reference{} = ref, table, name),
       do: ", ADD CONSTRAINT #{reference_name(ref, table, name)} " <>
           "FOREIGN KEY (#{quote_name(name)}) " <>
           "REFERENCES #{quote_table(table.prefix, ref.table)}(#{quote_name(ref.column)})" <>
-          reference_on_delete(ref.on_delete)
+          reference_on_delete(ref.on_delete) <> reference_on_update(ref.on_update)
 
     # A reference pointing to a serial column becomes integer in postgres
     defp reference_name(%Reference{name: nil}, table, column),
@@ -727,7 +808,16 @@ if Code.ensure_loaded?(Postgrex.Connection) do
     defp reference_on_delete(:delete_all), do: " ON DELETE CASCADE"
     defp reference_on_delete(_), do: ""
 
+    defp reference_on_update(:nilify_all), do: " ON UPDATE SET NULL"
+    defp reference_on_update(:update_all), do: " ON UPDATE CASCADE"
+    defp reference_on_update(_), do: ""
+
     ## Helpers
+
+    defp get_source(query, sources, ix, source) do
+      {expr, name, _schema} = elem(sources, ix)
+      {expr || "(" <> expr(source, sources, query) <> ")", name}
+    end
 
     defp quote_name(name)
     defp quote_name(name) when is_atom(name),
@@ -751,6 +841,8 @@ if Code.ensure_loaded?(Postgrex.Connection) do
       <<?", name::binary, ?">>
     end
 
+    defp single_quote(value), do: "\'#{escape_string(value)}\'"
+
     defp assemble(list) do
       list
       |> List.flatten
@@ -772,6 +864,7 @@ if Code.ensure_loaded?(Postgrex.Connection) do
     defp ecto_to_db(:datetime),   do: "timestamp"
     defp ecto_to_db(:binary),     do: "bytea"
     defp ecto_to_db(:map),        do: "jsonb"
+    defp ecto_to_db({:map, _}),   do: "jsonb"
     defp ecto_to_db(other),       do: Atom.to_string(other)
 
     defp error!(nil, message) do

@@ -41,6 +41,10 @@ defmodule Ecto.Query.Builder.Join do
     {var, expr, assoc, params}
   end
 
+  def escape({:subquery, _, [expr]}, _vars, _env) do
+    {:_, quote(do: Ecto.Query.subquery(unquote(expr))), nil, %{}}
+  end
+
   def escape({:fragment, _, [_|_]} = expr, vars, env) do
     {expr, params} = Builder.escape(expr, :any, %{}, vars, env)
     {:_, expr, nil, params}
@@ -64,6 +68,7 @@ defmodule Ecto.Query.Builder.Join do
 
   def escape({:assoc, _, [{var, _, context}, field]}, vars, _env)
       when is_atom(var) and is_atom(context) do
+    ensure_field!(field)
     var   = Builder.find_var!(var, vars)
     field = Builder.quoted_field!(field)
     {:_, nil, {var, field}, %{}}
@@ -86,8 +91,10 @@ defmodule Ecto.Query.Builder.Join do
     do: {expr, nil}
   def join!({source, module}) when is_binary(source) and is_atom(module),
     do: {source, module}
-  def join!(expr),
-    do: Builder.error!("expected join to be a string, atom or {string, atom}, got: `#{inspect expr}`")
+  def join!(expr) do
+    raise ArgumentError,
+      "expected join to be a string, atom or {string, atom}, got: `#{inspect expr}`"
+  end
 
   @doc """
   Builds a quoted expression.
@@ -106,17 +113,15 @@ defmodule Ecto.Query.Builder.Join do
     qual = validate_qual(qual)
     validate_bind(join_bind, binding)
 
-    if join_bind != :_ and !count_bind do
-      # If count_bind is not an integer, make it a variable.
-      # The variable is the getter/setter storage.
-      count_bind = quote(do: count_bind)
-      count_setter = quote(do: unquote(count_bind) = Builder.count_binds(query))
-    end
-
-    if on && join_assoc do
-      Builder.error! "cannot specify `on` on `#{qual}_join` when using association join, " <>
-                     "add extra clauses with `where` instead"
-    end
+    {count_bind, count_setter} =
+      if join_bind != :_ and !count_bind do
+        # If count_bind is not an integer, make it a variable.
+        # The variable is the getter/setter storage.
+        {quote(do: count_bind),
+         quote(do: count_bind = Builder.count_binds(query))}
+      else
+        {count_bind, nil}
+      end
 
     binding = binding ++ [{join_bind, count_bind}]
     join_on = escape_on(on || true, binding, env)
@@ -129,17 +134,17 @@ defmodule Ecto.Query.Builder.Join do
                   params: unquote(join_params)}
       end
 
-    if is_integer(count_bind) do
-      count_bind = count_bind + 1
-      quoted = Builder.apply_query(query, __MODULE__, [join], env)
-    else
-      count_bind = quote(do: unquote(count_bind) + 1)
-      quoted =
-        quote do
-          query = Ecto.Queryable.to_query(unquote(query))
-          unquote(count_setter)
-          %{query | joins: query.joins ++ [unquote(join)]}
-        end
+    {count_bind, quoted} =
+      if is_integer(count_bind) do
+        {count_bind + 1,
+         Builder.apply_query(query, __MODULE__, [join], env)}
+      else
+        {quote(do: unquote(count_bind) + 1),
+         quote do
+           query = Ecto.Queryable.to_query(unquote(query))
+           unquote(count_setter)
+           %{query | joins: query.joins ++ [unquote(join)]}
+         end}
       end
 
     {quoted, binding, count_bind}
@@ -175,14 +180,20 @@ defmodule Ecto.Query.Builder.Join do
     end
   end
 
-  @qualifiers [:inner, :left, :right, :full]
+  @qualifiers [:inner, :inner_lateral, :left, :left_lateral, :right, :full]
 
   @doc """
   Called at runtime to check dynamic qualifier.
   """
   def qual!(qual) when qual in @qualifiers, do: qual
   def qual!(qual) do
-    Builder.error! "invalid join qualifier `#{inspect qual}`, accepted qualifiers are: " <>
-                   Enum.map_join(@qualifiers, ", ", &"`#{inspect &1}`")
+    raise ArgumentError,
+      "invalid join qualifier `#{inspect qual}`, accepted qualifiers are: " <>
+      Enum.map_join(@qualifiers, ", ", &"`#{inspect &1}`")
   end
+
+  defp ensure_field!({var, _, _}) when var != :^ do
+    Builder.error! "you passed the variable `#{var}` to `assoc/2`. Did you mean to pass the atom `:#{var}?`"
+  end
+  defp ensure_field!(_), do: true
 end

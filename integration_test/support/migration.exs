@@ -5,16 +5,17 @@ defmodule Ecto.Integration.Migration do
     create table(:users) do
       add :name, :text
       add :custom_id, :uuid
-      timestamps
+      timestamps()
     end
 
     create table(:posts) do
       add :title, :string, size: 100
-      add :counter, :integer, default: 10 # Do not propagate unless read_after_write
+      add :counter, :integer
       add :text, :binary
       add :bid, :binary_id
       add :uuid, :uuid
       add :meta, :map
+      add :links, {:map, :string}
       add :public, :boolean
       add :cost, :decimal, precision: 2, scale: 1
       add :visits, :integer
@@ -22,6 +23,17 @@ defmodule Ecto.Integration.Migration do
       add :author_id, :integer
       add :posted, :date
       timestamps null: true
+    end
+
+    create table(:posts_users, primary_key: false) do
+      add :post_id, references(:posts)
+      add :user_id, references(:users)
+    end
+
+    create table(:posts_users_pk) do
+      add :post_id, references(:posts)
+      add :user_id, references(:users)
+      timestamps()
     end
 
     # Add a unique index on uuid. We use this
@@ -49,6 +61,11 @@ defmodule Ecto.Integration.Migration do
 
     create unique_index(:customs, [:uuid])
 
+    create table(:posts_customs, primary_key: false) do
+      add :post_id, references(:posts, column: :uuid, type: :uuid)
+      add :custom_id, references(:customs, column: :bid, type: :binary_id)
+    end
+
     create table(:barebones) do
       add :num, :integer
     end
@@ -63,6 +80,7 @@ defmodule Ecto.Integration.Migration do
 
     create table(:orders) do
       add :item, :map
+      add :comment_id, references(:comments)
     end
 
     unless :array_type in ExUnit.configuration[:exclude] do
@@ -71,6 +89,18 @@ defmodule Ecto.Integration.Migration do
         add :uuids, {:array, :uuid}, default: []
         add :items, {:array, :map}
       end
+    end
+
+    create table(:composite_pk, primary_key: false) do
+      add :a, :integer, primary_key: true
+      add :b, :integer, primary_key: true
+      add :name, :string
+    end
+
+    create table(:posts_users_composite_pk) do
+      add :post_id, references(:posts), primary_key: true
+      add :user_id, references(:users), primary_key: true
+      timestamps()
     end
   end
 end

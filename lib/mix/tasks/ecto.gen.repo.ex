@@ -4,7 +4,7 @@ defmodule Mix.Tasks.Ecto.Gen.Repo do
   import Mix.Ecto
   import Mix.Generator
 
-  @shortdoc "Generate a new repository"
+  @shortdoc "Generates a new repository"
 
   @moduledoc """
   Generates a new repository.
@@ -13,7 +13,6 @@ defmodule Mix.Tasks.Ecto.Gen.Repo do
 
   ## Examples
 
-      mix ecto.gen.repo
       mix ecto.gen.repo -r Custom.Repo
 
   This generator will automatically open the config/config.exs
@@ -22,21 +21,23 @@ defmodule Mix.Tasks.Ecto.Gen.Repo do
 
   ## Command line options
 
-    * `-r`, `--repo` - the repo to generate (defaults to `YourApp.Repo`)
+    * `-r`, `--repo` - the repo to generate
 
   """
 
   @doc false
   def run(args) do
     no_umbrella!("ecto.gen.repo")
-    [repo|other_repos] = parse_repo(args)
 
-    if other_repos != [] do
-      Mix.raise "Only specify one repo at a time when generating with ecto.gen.repo"
-    end
+    repo =
+      case parse_repo(args) do
+        [] -> Mix.raise "ecto.gen.repo expects the repository to be given as -r MyApp.Repo"
+        [repo] -> repo
+        [_ | _] -> Mix.raise "ecto.gen.repo expects a single repository to be given"
+      end
 
     config      = Mix.Project.config
-    underscored = Mix.Utils.underscore(inspect(repo))
+    underscored = Macro.underscore(inspect(repo))
 
     base = Path.basename(underscored)
     file = Path.join("lib", underscored) <> ".ex"
@@ -61,7 +62,14 @@ defmodule Mix.Tasks.Ecto.Gen.Repo do
     Don't forget to add your new repo to your supervision tree
     (typically in lib/#{app}.ex):
 
-        worker(#{inspect repo}, [])
+        supervisor(#{inspect repo}, [])
+
+    And to add it to the list of ecto repositories in your
+    configuration files (so Ecto tasks work as expected):
+
+        config #{inspect app},
+          ecto_repos: [#{inspect repo}]
+
     """
   end
 

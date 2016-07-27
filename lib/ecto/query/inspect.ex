@@ -1,5 +1,6 @@
 defimpl Inspect, for: Ecto.Query do
   import Inspect.Algebra
+  import Kernel, except: [to_string: 1]
   alias Ecto.Query.JoinExpr
 
   @doc false
@@ -57,9 +58,12 @@ defimpl Inspect, for: Ecto.Query do
 
   defp unbound_from(nil),           do: "query"
   defp unbound_from({source, nil}), do: inspect source
-  defp unbound_from({nil, model}),  do: inspect model
-  defp unbound_from(from = {source, model}) do
-    inspect if(source == model.__schema__(:source), do: model, else: from)
+  defp unbound_from({nil, schema}),  do: inspect schema
+  defp unbound_from(from = {source, schema}) do
+    inspect if(source == schema.__schema__(:source), do: schema, else: from)
+  end
+  defp unbound_from(%Ecto.SubQuery{query: query}) do
+    "subquery(#{to_string query})"
   end
 
   defp joins(joins, names) do
@@ -73,13 +77,13 @@ defimpl Inspect, for: Ecto.Query do
     [{join_qual(qual), string}]
   end
 
-  defp join(%JoinExpr{qual: qual, source: {source, model}, on: on}, name, names) do
-    string = "#{name} in #{unbound_from {source, model}}"
+  defp join(%JoinExpr{qual: qual, source: {:fragment, _, _} = source, on: on} = part, name, names) do
+    string = "#{name} in #{expr(source, names, part)}"
     [{join_qual(qual), string}, on: expr(on, names)]
   end
 
-  defp join(%JoinExpr{qual: qual, source: source, params: params, on: on}, name, names) do
-    string = "#{name} in #{expr(source, names, params)}"
+  defp join(%JoinExpr{qual: qual, source: source, on: on}, name, names) do
+    string = "#{name} in #{unbound_from source}"
     [{join_qual(qual), string}, on: expr(on, names)]
   end
 
@@ -108,20 +112,31 @@ defimpl Inspect, for: Ecto.Query do
   defp kw_inspect(_key, nil), do: []
   defp kw_inspect(key, val),  do: [{key, inspect(val)}]
 
-  defp expr(%{expr: expr, params: params}, names) do
-    expr(expr, names, params)
+  defp expr(%{expr: expr} = part, names) do
+    expr(expr, names, part)
   end
 
-  defp expr(expr, names, params) do
-    Macro.to_string(expr, &expr_to_string(&1, &2, names, params))
+  defp expr(expr, names, part) do
+    Macro.to_string(expr, &expr_to_string(&1, &2, names, part))
   end
 
   # For keyword and interpolated fragments use normal escaping
-  defp expr_to_string({:fragment, _, [{_, _}|_] = parts}, _, names, params) do
-    "fragment(" <> unmerge_fragments(parts, "", [], names, params) <> ")"
+  defp expr_to_string({:fragment, _, [{_, _}|_] = parts}, _, names, part) do
+    "fragment(" <> unmerge_fragments(parts, "", [], names, part) <> ")"
   end
 
   # Convert variables to proper names
+  defp expr_to_string({:&, _, [ix]}, _, names, %{take: take}) do
+    case take do
+      %{^ix => {:any, fields}} when ix == 0 ->
+        Kernel.inspect(fields)
+      %{^ix => {tag, fields}} ->
+        "#{tag}(" <> elem(names, ix) <> ", " <> Kernel.inspect(fields) <> ")"
+      _ ->
+        elem(names, ix)
+    end
+  end
+
   defp expr_to_string({:&, _, [ix]}, _, names, _) do
     elem(names, ix)
   end
@@ -130,17 +145,15 @@ defimpl Inspect, for: Ecto.Query do
   #
   # In case the query had its parameters removed,
   # we use ... to express the interpolated code.
-  defp expr_to_string({:^, _, [_ix, _len]}, _, _, _params) do
+  defp expr_to_string({:^, _, [_ix, _len]}, _, _, _part) do
     Macro.to_string {:^, [], [{:..., [], nil}]}
   end
 
-  defp expr_to_string({:^, _, [ix]}, _, _, params) do
-    escaped =
-      case Enum.at(params || [], ix) do
-        {value, _type} -> Macro.escape(value)
-        _              -> {:..., [], nil}
-      end
-    Macro.to_string {:^, [], [escaped]}
+  defp expr_to_string({:^, _, [ix]}, _, _, %{params: params}) do
+    case Enum.at(params || [], ix) do
+      {value, _type} -> "^" <> Kernel.inspect(value, char_lists: :as_lists)
+      _              -> "^..."
+    end
   end
 
   # Strip trailing ()
@@ -150,46 +163,49 @@ defimpl Inspect, for: Ecto.Query do
   end
 
   # Tagged values
-  defp expr_to_string(%Ecto.Query.Tagged{value: value, tag: nil}, _, _names, _params) do
+  defp expr_to_string(%Ecto.Query.Tagged{value: value, tag: nil}, _, _names, _) do
     inspect value
   end
 
-  defp expr_to_string(%Ecto.Query.Tagged{value: value, tag: tag}, _, names, params) do
-    {:type, [], [value, tag]} |> expr(names, params)
+  defp expr_to_string(%Ecto.Query.Tagged{value: value, tag: tag}, _, names, part) do
+    {:type, [], [value, tag]} |> expr(names, part)
   end
 
   defp expr_to_string(_expr, string, _, _) do
     string
   end
 
-  defp unmerge_fragments([{:raw, s}, {:expr, v}|t], frag, args, names, params) do
-    unmerge_fragments(t, frag <> s <> "?", [expr(v, names, params)|args], names, params)
+  defp unmerge_fragments([{:raw, s}, {:expr, v}|t], frag, args, names, part) do
+    unmerge_fragments(t, frag <> s <> "?", [expr(v, names, part)|args], names, part)
   end
 
-  defp unmerge_fragments([{:raw, s}], frag, args, _names, _params) do
+  defp unmerge_fragments([{:raw, s}], frag, args, _names, _part) do
     Enum.join [inspect(frag <> s)|Enum.reverse(args)], ", "
   end
 
-  defp join_qual(:inner), do: :join
-  defp join_qual(:left),  do: :left_join
-  defp join_qual(:right), do: :right_join
-  defp join_qual(:full),  do: :full_join
+  defp join_qual(:inner),         do: :join
+  defp join_qual(:inner_lateral), do: :join_lateral
+  defp join_qual(:left),          do: :left_join
+  defp join_qual(:left_lateral),  do: :left_join_lateral
+  defp join_qual(:right),         do: :right_join
+  defp join_qual(:full),          do: :full_join
 
   defp collect_sources(query) do
-    from_sources(query.from) ++ join_sources(query.joins)
+    [from_sources(query.from) | join_sources(query.joins)]
   end
 
-  defp from_sources({source, model}), do: [model || source]
-  defp from_sources(nil),             do: ["query"]
+  defp from_sources(%Ecto.SubQuery{query: query}), do: from_sources(query.from)
+  defp from_sources({source, schema}), do: schema || source
+  defp from_sources(nil), do: "query"
 
   defp join_sources(joins) do
     Enum.map(joins, fn
       %JoinExpr{assoc: {_var, assoc}} ->
         assoc
-      %JoinExpr{source: {source, model}} ->
-        model || source
       %JoinExpr{source: {:fragment, _, _}} ->
         "fragment"
+      %JoinExpr{source: source} ->
+        from_sources(source)
     end)
   end
 

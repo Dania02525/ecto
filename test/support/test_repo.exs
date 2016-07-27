@@ -5,85 +5,87 @@ defmodule Ecto.TestAdapter do
 
   defmacro __before_compile__(_opts), do: :ok
 
-  def start_link(_repo, opts) do
-    Ecto.TestRepo.Pool = opts[:pool_name]
-    Ecto.Pools.Poolboy = opts[:pool]
-    Ecto.TestRepo      = opts[:repo]
+  def ensure_all_started(_, _) do
+    {:ok, []}
+  end
 
+  def child_spec(_repo, opts) do
     :ecto   = opts[:otp_app]
     "user"  = opts[:username]
     "pass"  = opts[:password]
     "hello" = opts[:database]
     "local" = opts[:hostname]
 
-    Task.start_link(fn -> :timer.sleep(:infinity) end)
-  end
-
-  def stop(_, _, _) do
-    :ok
+    Supervisor.Spec.worker(Task, [fn -> :timer.sleep(:infinity) end])
   end
 
   ## Types
 
-  def load(:binary_id, data), do: Ecto.Type.load(Ecto.UUID, data, &load/2)
-  def load(type, data), do: Ecto.Type.load(type, data, &load/2)
+  def loaders(:binary_id, type), do: [Ecto.UUID, type]
+  def loaders(_primitive, type), do: [type]
 
-  def dump(:binary_id, data), do: Ecto.Type.dump(Ecto.UUID, data, &dump/2)
-  def dump(type, data), do: Ecto.Type.dump(type, data, &dump/2)
+  def dumpers(:binary_id, type), do: [type, Ecto.UUID]
+  def dumpers(_primitive, type), do: [type]
 
-  def embed_id(%Ecto.Embedded{}), do: Ecto.UUID.generate
+  def autogenerate(:id), do: nil
+  def autogenerate(:embed_id), do: Ecto.UUID.autogenerate
+  def autogenerate(:binary_id), do: Ecto.UUID.autogenerate
 
   ## Queryable
 
   def prepare(operation, query), do: {:nocache, {operation, query}}
 
-  def execute(_repo, _, {:all, %{from: {_, SchemaMigration}}}, _, _, _) do
+  def execute(_repo, _, {:nocache, {:all, %{from: {_, SchemaMigration}}}}, _, _, _) do
     {length(migrated_versions()),
      Enum.map(migrated_versions(), &List.wrap/1)}
-   end
+  end
 
-  def execute(_repo, _, {:all, _}, _, _, _) do
+  def execute(_repo, _, {:nocache, {:all, _}}, _, _, _) do
     {1, [[1]]}
   end
 
-  def execute(_repo, _meta, {:delete_all, %{from: {_, SchemaMigration}}}, [version], _, _) do
+  def execute(_repo, _meta, {:nocache, {:delete_all, %{from: {_, SchemaMigration}}}}, [version], _, _) do
     Process.put(:migrated_versions, List.delete(migrated_versions(), version))
     {1, nil}
   end
 
-  def execute(_repo, _meta, {_, _}, _params, _preprocess, _opts) do
+  def execute(_repo, _meta, {:nocache, {op, %{from: {source, _}}}}, _params, _preprocess, _opts) do
+    send self(), {op, source}
     {1, nil}
   end
 
-  ## Model
+  ## Schema
 
-  def insert(_repo, %{source: {nil, "schema_migrations"}}, val, _, _, _) do
+  def insert_all(_repo, %{source: {_, source}}, _header, rows, _returning, _opts) do
+    send self(), {:insert_all, source, rows}
+    {1, nil}
+  end
+
+  def insert(_repo, %{source: {nil, "schema_migrations"}}, val, _, _) do
     version = Keyword.fetch!(val, :version)
     Process.put(:migrated_versions, [version|migrated_versions()])
     {:ok, [version: 1]}
   end
 
-  def insert(repo, model_meta, fields, {key, :id, nil}, return, opts),
-    do: insert(repo, model_meta, fields, nil, [key|return], opts)
-  def insert(_repo, %{context: nil}, _fields, _autogen, return, _opts),
-    do: {:ok, Enum.zip(return, 1..length(return))}
-  def insert(_repo, %{context: {:invalid, _}=res}, _fields, _autogen, _return, _opts),
+  def insert(_repo, %{context: nil}, _fields, return, _opts),
+    do: send(self(), :insert) && {:ok, Enum.zip(return, 1..length(return))}
+  def insert(_repo, %{context: {:invalid, _}=res}, _fields, _return, _opts),
     do: res
 
   # Notice the list of changes is never empty.
-  def update(_repo, %{context: nil}, [_|_], _filters, _autogen, return, _opts),
-    do: {:ok, Enum.zip(return, 1..length(return))}
-  def update(_repo, %{context: {:invalid, _}=res}, [_|_], _filters, _autogen, _return, _opts),
+  def update(_repo, %{context: nil}, [_|_], _filters, return, _opts),
+    do: send(self(), :update) && {:ok, Enum.zip(return, 1..length(return))}
+  def update(_repo, %{context: {:invalid, _}=res}, [_|_], _filters, _return, _opts),
     do: res
 
-  def delete(_repo, _model_meta, _filter, _autogen, _opts),
-    do: {:ok, []}
+  def delete(_repo, _schema_meta, _filter, _opts),
+    do: send(self(), :delete) && {:ok, []}
 
   ## Transactions
 
   def transaction(_repo, _opts, fun) do
     # Makes transactions "trackable" in tests
-    send self, {:transaction, fun}
+    send self(), {:transaction, fun}
     try do
       {:ok, fun.()}
     catch
@@ -93,7 +95,7 @@ defmodule Ecto.TestAdapter do
   end
 
   def rollback(_repo, value) do
-    send self, {:rollback, value}
+    send self(), {:rollback, value}
     throw {:ecto_rollback, value}
   end
 
