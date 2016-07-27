@@ -236,7 +236,7 @@ defmodule Ecto.Migrator do
 
     Enum.map migrations, fn {version, _name, file} ->
       {mod, _bin} =
-        Enum.find(Code.load_file(file), fn {mod, _bin} ->
+        Enum.find(Code.require_file(file), fn {mod, _bin} ->
           function_exported?(mod, :__migration__, 0)
         end) || raise_no_migration_in_file(file)
 
